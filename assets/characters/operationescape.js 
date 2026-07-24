@@ -1,0 +1,4115 @@
+import {
+    create_rectangle,
+    create_circle,
+    create_triangle,
+    create_text,
+    create_audio,
+    play_audio,
+    update_position,
+    update_color,
+    update_rotation,
+    update_scale,
+    query_position,
+    query_color,
+    pointer_over_gameobject,
+    input_key_down,
+    input_left_mouse_down,
+    set_dimensions,
+    set_fps,
+    get_loop_count,
+    update_loop,
+    build_game,
+    create_sprite
+} from "arcade_2d";
+
+// ================================================================
+//  OPERATION ESCAPE
+//  Scene 1: Title screen (goofy detective corkboard menu)
+//  Scene 1.5: Character Selection (choose your detective)
+//  Scene 2: Room Select (mysterious hallway with 4 doors)
+//  Scene 3: Room 1 - The Detective's Study (puzzle-gated escape room)
+//  Scene 4: Room 2 - The Blackwood Library (cinematic introduction)
+//
+//  IMPORTANT - how scene switching works in this API:
+//  arcade_2d has no "delete gameobject" function, so every object
+//  for every scene is created once, up front. Switching scenes
+//  does NOT create/destroy anything - it just shoves the previous
+//  scene's objects far off-screen and fades them to alpha 0, then
+//  brings the new scene's objects back on-screen at full alpha.
+//  See hide_scene() / show_scene() / change_scene() below.
+//
+//  Because there is also no update_text(), all dialogue AND all
+//  puzzle UI (tiles, options, digits, and the typed-answer letters)
+//  are fixed, pre-made text objects whose CONTENT never changes -
+//  only their position/color/alpha is toggled at runtime. Every
+//  gameobject in this file is created exactly once, up front,
+//  during the "ASSEMBLE ALL SCENES" section below - none are ever
+//  created inside update_loop.
+//
+//  NOTE: Source Academy's language does not support JS object
+//  literals ({ key: value }) or dot-notation property access on
+//  them. All "records" in this file (doors, candles, room state,
+//  puzzle tiles, characters, etc.) are plain arrays accessed by
+//  index, with named index constants used where it helps
+//  readability (see ST_* and CH_* below).
+// ================================================================
+
+const SCREEN_WIDTH = 800;
+const SCREEN_HEIGHT = 600;
+set_dimensions([SCREEN_WIDTH, SCREEN_HEIGHT]);
+
+const FPS = 30;
+set_fps(FPS);
+
+const OFFSCREEN_X = 6000; // far enough that it can never be hovered/seen
+
+// ----------------------------------------------------------------
+//  generic creation helpers - every helper takes a "list" as its
+//  first argument. Pass a scene's entry list to register the new
+//  object with that scene (so it can be hidden/shown later), or
+//  pass undefined for a one-off object that never needs hiding.
+// ----------------------------------------------------------------
+function reg(list, obj) {
+    if (list !== undefined) {
+        const col = query_color(obj);
+        list[array_length(list)] = [obj, col[0], col[1], col[2], col[3]];
+    }
+    return obj;
+}
+
+function make_rect(list, x, y, w, h, r, g, b, a) {
+    const rect = create_rectangle(w, h);
+    update_position(rect, [x, y]);
+    update_color(rect, [r, g, b, a]);
+    return reg(list, rect);
+}
+
+function make_circle(list, x, y, radius, r, g, b, a) {
+    const circ = create_circle(radius);
+    update_position(circ, [x, y]);
+    update_color(circ, [r, g, b, a]);
+    return reg(list, circ);
+}
+
+function make_triangle(list, x, y, w, h, r, g, b, a) {
+    const tri = create_triangle(w, h);
+    update_position(tri, [x, y]);
+    update_color(tri, [r, g, b, a]);
+    return reg(list, tri);
+}
+
+function make_text(list, x, y, text, scale, r, g, b, a) {
+    const t = create_text(text);
+    update_position(t, [x, y]);
+    update_scale(t, [scale, scale]);
+    update_color(t, [r, g, b, a]);
+    return reg(list, t);
+}
+
+// A thin rotated rectangle stretched between two points - used for
+// the red "conspiracy yarn" strings on the title-screen corkboard.
+function make_string(list, x1, y1, x2, y2, r, g, b, a, thickness) {
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    const length = math_sqrt(dx * dx + dy * dy);
+    const angle = math_atan2(dy, dx);
+    const mx = (x1 + x2) / 2;
+    const my = (y1 + y2) / 2;
+    const line = make_rect(list, mx, my, length, thickness, r, g, b, a);
+    update_rotation(line, angle);
+    return line;
+}
+
+// ----------------------------------------------------------------
+//  scene manager - hide_scene / show_scene / change_scene
+// ----------------------------------------------------------------
+function hide_scene(list) {
+    for (let i = 0; i < array_length(list); i = i + 1) {
+        const e = list[i];
+        const obj = e[0];
+        const pos = query_position(obj);
+        update_position(obj, [pos[0] + OFFSCREEN_X, pos[1]]);
+        update_color(obj, [e[1], e[2], e[3], 0]);
+    }
+    return undefined;
+}
+
+function show_scene(list) {
+    for (let i = 0; i < array_length(list); i = i + 1) {
+        const e = list[i];
+        const obj = e[0];
+        const pos = query_position(obj);
+        update_position(obj, [pos[0] - OFFSCREEN_X, pos[1]]);
+        update_color(obj, [e[1], e[2], e[3], e[4]]);
+    }
+    return undefined;
+}
+
+let current_scene = "landing"; // "landing" | "char_select" | "room_select" | "room1" | "room2"
+
+// landing_entries / char_select_entries / room_select_entries /
+// room1_entries / room2_entries are filled in further down, once each scene's
+// objects have been created.
+let landing_entries = [];
+let char_select_entries = [];
+let room_select_entries = [];
+let room1_entries = [];
+let room2_entries = [];
+
+function scene_entries(name) {
+    if (name === "landing") { return landing_entries; }
+    if (name === "char_select") { return char_select_entries; }
+    if (name === "room_select") { return room_select_entries; }
+    if (name === "room1") { return room1_entries; }
+    return room2_entries;
+}
+
+function change_scene(new_scene) {
+    if (new_scene === current_scene) {
+        return undefined;
+    }
+    hide_scene(scene_entries(current_scene));
+    show_scene(scene_entries(new_scene));
+    current_scene = new_scene;
+    return undefined;
+}
+
+// ================================================================
+//  SHARED INPUT EDGE-TRIGGER HELPERS
+//  (only one scene is ever "live" at a time, so it is safe for
+//  every scene to share the same previous-frame flags)
+// ================================================================
+let confirm_prev = false;
+let esc_prev = false;
+let mouse_prev = false;
+
+function confirm_pressed_this_frame() {
+    const down = input_key_down("Enter") || input_key_down(" ");
+    const pressed = down && !confirm_prev;
+    confirm_prev = down;
+    return pressed;
+}
+
+function escape_pressed_this_frame() {
+    const down = input_key_down("Escape");
+    const pressed = down && !esc_prev;
+    esc_prev = down;
+    return pressed;
+}
+
+function mouse_clicked_this_frame() {
+    const down = input_left_mouse_down();
+    const clicked = down && !mouse_prev;
+    mouse_prev = down;
+    return clicked;
+}
+
+// Shared 0-9 digit edge-trigger, reused by every number-key puzzle.
+let digit_prev = [false, false, false, false, false, false, false, false, false, false];
+const DIGIT_KEYS = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
+
+// Returns the digit (0-9) that was newly pressed down this frame,
+// or -1 if none was. Only ever returns the first one found, which
+// is fine since these puzzles expect single key-taps, not chords.
+function pressed_digit_this_frame() {
+    let result = -1;
+    for (let d = 0; d < 10; d = d + 1) {
+        const down = input_key_down(DIGIT_KEYS[d]);
+        const pressed = down && !digit_prev[d];
+        digit_prev[d] = down;
+        if (pressed && result === -1) {
+            result = d;
+        }
+    }
+    return result;
+}
+
+// ================================================================
+//  SCENE 1: LANDING / TITLE SCREEN
+//  (background mystery room + goofy detective corkboard menu)
+// ================================================================
+
+function draw_room(list) {
+    make_rect(list, SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2, SCREEN_WIDTH, SCREEN_HEIGHT, 60, 58, 62, 255);
+
+    for (let row = 0; row < 5; row = row + 1) {
+        make_rect(list, SCREEN_WIDTH / 2, 40 + row * 80, SCREEN_WIDTH, 3, 40, 38, 42, 200);
+    }
+
+    for (let col = 0; col < 8; col = col + 1) {
+        make_rect(list, 50 + col * 100, 220, 3, 440, 40, 38, 42, 160);
+    }
+
+    make_rect(list, SCREEN_WIDTH / 2, 520, SCREEN_WIDTH, 160, 92, 60, 33, 255);
+
+    for (let plank = 0; plank < 7; plank = plank + 1) {
+        make_rect(list, 60 + plank * 110, 520, 4, 160, 60, 38, 20, 255);
+    }
+
+    return undefined;
+}
+
+// Decorative locked door prop behind the title menu (kept from the
+// original background scene - not to be confused with the hallway
+// doors in the Room Select scene further down).
+function draw_landing_door_prop(list) {
+    const door_x = SCREEN_WIDTH / 2;
+    const door_top = 150;
+    const door_height = 300;
+    const door_width = 200;
+    const door_y = door_top + door_height / 2;
+
+    const parts = [];
+    let n = 0;
+    const track_part = (obj, x, y) => {
+        parts[n] = [obj, x, y];
+        n = n + 1;
+        return obj;
+    };
+
+    track_part(make_rect(list, door_x, door_y, door_width + 30, door_height + 20, 45, 43, 46, 255), door_x, door_y);
+    track_part(make_rect(list, door_x, door_y, door_width, door_height, 70, 45, 25, 255), door_x, door_y);
+    track_part(make_rect(list, door_x, door_y - 60, door_width - 40, 100, 60, 38, 20, 255), door_x, door_y - 60);
+    track_part(make_rect(list, door_x, door_y + 60, door_width - 40, 100, 60, 38, 20, 255), door_x, door_y + 60);
+
+    const brace_1 = make_rect(list, door_x, door_y, door_width - 10, 10, 25, 25, 28, 255);
+    update_rotation(brace_1, math_PI / 6);
+    track_part(brace_1, door_x, door_y);
+
+    const brace_2 = make_rect(list, door_x, door_y, door_width - 10, 10, 25, 25, 28, 255);
+    update_rotation(brace_2, -math_PI / 6);
+    track_part(brace_2, door_x, door_y);
+
+    track_part(make_rect(list, door_x, door_y + door_height / 2 - 40, 50, 60, 20, 20, 22, 255),
+          door_x, door_y + door_height / 2 - 40);
+
+    track_part(make_circle(list, door_x, door_y + door_height / 2 - 55, 8, 5, 5, 5, 255),
+          door_x, door_y + door_height / 2 - 55);
+    track_part(make_triangle(list, door_x, door_y + door_height / 2 - 40, 10, 16, 5, 5, 5, 255),
+          door_x, door_y + door_height / 2 - 40);
+
+    return parts;
+}
+
+function draw_one_candle(list, x, y, phase) {
+    const glow = make_circle(list, x, y - 70, 45, 255, 200, 90, 60);
+    make_rect(list, x, y + 20, 26, 12, 40, 40, 42, 255);
+    make_rect(list, x, y - 20, 14, 80, 235, 225, 200, 255);
+    const flame_outer = make_triangle(list, x, y - 68, 14, 22, 255, 170, 40, 255);
+    const flame_inner = make_triangle(list, x, y - 74, 8, 12, 255, 230, 120, 255);
+    return [flame_outer, flame_inner, glow, phase];
+}
+
+function draw_candles(list) {
+    const candle_1 = draw_one_candle(list, 130, 400, 0);
+    const candle_2 = draw_one_candle(list, 670, 400, 3.1);
+    return [candle_1, candle_2];
+}
+
+function draw_table(list) {
+    const table_x = SCREEN_WIDTH / 2;
+    const table_y = 470;
+
+    make_rect(list, table_x - 70, table_y + 45, 12, 70, 55, 35, 18, 255);
+    make_rect(list, table_x + 70, table_y + 45, 12, 70, 55, 35, 18, 255);
+    make_rect(list, table_x, table_y, 200, 24, 92, 60, 33, 255);
+    make_rect(list, table_x, table_y - 8, 200, 6, 110, 74, 40, 255);
+
+    return undefined;
+}
+
+function draw_key(list) {
+    const key_x = SCREEN_WIDTH / 2;
+    const key_y = 445;
+
+    const parts = [];
+    let n = 0;
+    const track_part = (obj, x, y) => {
+        parts[n] = [obj, x, y];
+        n = n + 1;
+        return obj;
+    };
+
+    track_part(make_circle(list, key_x, key_y, 40, 255, 230, 100, 70), key_x, key_y);
+    track_part(make_circle(list, key_x - 25, key_y, 14, 210, 175, 60, 255), key_x - 25, key_y);
+    track_part(make_circle(list, key_x - 25, key_y, 6, 60, 45, 15, 255), key_x - 25, key_y);
+    track_part(make_rect(list, key_x + 5, key_y, 45, 6, 210, 175, 60, 255), key_x + 5, key_y);
+    track_part(make_rect(list, key_x + 22, key_y + 8, 6, 12, 210, 175, 60, 255), key_x + 22, key_y + 8);
+    track_part(make_rect(list, key_x + 32, key_y + 6, 6, 8, 210, 175, 60, 255), key_x + 32, key_y + 6);
+
+    return parts;
+}
+
+function create_dust(list, count, min_y, max_y) {
+    const dust = [];
+
+    for (let i = 0; i < count; i = i + 1) {
+        const base_y = min_y + math_random() * (max_y - min_y);
+        const phase = math_random() * 1000;
+        const speed = 12 + math_random() * 18;
+        const start_x = math_random() * SCREEN_WIDTH;
+        const radius = 2 + math_random() * 2;
+
+        const speck = make_circle(list, start_x, base_y, radius, 210, 205, 190, 90);
+        dust[i] = [speck, base_y, phase, speed, start_x];
+    }
+
+    return dust;
+}
+
+function animate_candles(candles, t) {
+    for (let i = 0; i < array_length(candles); i = i + 1) {
+        const c = candles[i];
+        const flame_outer = c[0];
+        const flame_inner = c[1];
+        const glow = c[2];
+        const phase = c[3];
+
+        const flicker = 0.85 + 0.12 * math_sin(t * 9 + phase) + 0.05 * math_sin(t * 23 + phase * 1.7);
+        update_scale(flame_outer, [flicker, flicker]);
+        update_scale(flame_inner, [flicker * 1.05, flicker * 0.95]);
+
+        const glow_pulse = 0.85 + 0.15 * math_sin(t * 5 + phase);
+        update_scale(glow, [glow_pulse, glow_pulse]);
+    }
+    return undefined;
+}
+
+function animate_key(key_parts, t) {
+    const float_offset = 8 * math_sin(t * 1.3);
+    for (let i = 0; i < array_length(key_parts); i = i + 1) {
+        const part = key_parts[i];
+        update_position(part[0], [part[1], part[2] + float_offset]);
+    }
+    return undefined;
+}
+
+function animate_dust(dust, t) {
+    for (let i = 0; i < array_length(dust); i = i + 1) {
+        const d = dust[i];
+        const speck = d[0];
+        const base_y = d[1];
+        const phase = d[2];
+        const speed = d[3];
+        const start_x = d[4];
+
+        const x = (start_x + t * speed) % SCREEN_WIDTH;
+        const y = base_y + 12 * math_sin(t * 0.6 + phase);
+
+        update_position(speck, [x, y]);
+    }
+    return undefined;
+}
+
+function animate_landing_door_prop(door_parts, loop_count) {
+    const period_frames = 10 * FPS;
+    const shake_frames = math_round(0.5 * FPS);
+    const cycle_pos = loop_count % period_frames;
+
+    const shake_x = cycle_pos < shake_frames
+        ? 6 * (1 - cycle_pos / shake_frames) * math_sin(cycle_pos * 3.2)
+        : 0;
+
+    for (let i = 0; i < array_length(door_parts); i = i + 1) {
+        const part = door_parts[i];
+        update_position(part[0], [part[1] + shake_x, part[2]]);
+    }
+    return undefined;
+}
+
+// ---- conspiracy corkboard menu ----------------------------------
+function draw_dim_backdrop(list) {
+    make_rect(list, SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2, SCREEN_WIDTH, SCREEN_HEIGHT, 5, 5, 8, 190);
+    return undefined;
+}
+
+function draw_corkboard(list) {
+    const cx = SCREEN_WIDTH / 2;
+    const cy = 300;
+
+    make_rect(list, cx, cy, 620, 480, 90, 60, 35, 255);
+    make_rect(list, cx, cy, 580, 440, 196, 154, 108, 255);
+
+    for (let i = 0; i < 26; i = i + 1) {
+        const dot_x = cx - 270 + math_random() * 540;
+        const dot_y = cy - 200 + math_random() * 400;
+        make_circle(list, dot_x, dot_y, 2 + math_random() * 2, 150, 110, 70, 120);
+    }
+
+    return undefined;
+}
+
+function draw_clue_corner(list, x, y, tilt) {
+    const card = make_rect(list, x, y, 70, 55, 235, 228, 205, 255);
+    update_rotation(card, tilt);
+    const mark = make_text(list, x, y, "?", 1.1, 40, 40, 45, 255);
+    update_rotation(mark, tilt);
+    make_circle(list, x, y - 24, 5, 190, 30, 30, 255);
+    return [card, mark];
+}
+
+function draw_clues(list) {
+    const cx = SCREEN_WIDTH / 2;
+    const cy = 300;
+
+    const tl = draw_clue_corner(list, cx - 250, cy - 175, -0.18);
+    const tr = draw_clue_corner(list, cx + 250, cy - 175, 0.18);
+    const bl = draw_clue_corner(list, cx - 250, cy + 195, 0.12);
+    const br = draw_clue_corner(list, cx + 250, cy + 195, -0.12);
+
+    const center = [cx, cy + 15];
+    make_string(list, cx - 250, cy - 175, center[0], center[1], 200, 30, 30, 220, 3);
+    make_string(list, cx + 250, cy - 175, center[0], center[1], 200, 30, 30, 220, 3);
+    make_string(list, cx - 250, cy + 195, center[0], center[1], 200, 30, 30, 220, 3);
+    make_string(list, cx + 250, cy + 195, center[0], center[1], 200, 30, 30, 220, 3);
+
+    return [tl, tr, bl, br];
+}
+
+function draw_title(list) {
+    const x = SCREEN_WIDTH / 2;
+    const y = 95;
+    const shadow = make_text(list, x + 4, y + 4, "OPERATION ESCAPE", 1.75, 10, 5, 5, 190);
+    const title = make_text(list, x, y, "OPERATION ESCAPE", 1.75, 235, 195, 90, 255);
+    return [title, shadow, x, y];
+}
+
+// Returns [box, glow, text, pin, base_scale, base_tilt, index].
+function draw_button(list, label, x, y, index, base_tilt) {
+    const glow = make_rect(list, x, y, 270, 80, 255, 200, 90, 0);
+    const box = make_rect(list, x, y, 230, 60, 245, 235, 210, 255);
+    const text = make_text(list, x, y, label, 1.4, 40, 35, 30, 255);
+    const pin = make_circle(list, x, y - 34, 6, 190, 30, 30, 255);
+
+    update_rotation(box, base_tilt);
+    update_rotation(text, base_tilt);
+    update_rotation(glow, base_tilt);
+
+    return [box, glow, text, pin, 1.4, base_tilt, index];
+}
+
+function draw_menu_buttons(list) {
+    const play = draw_button(list, "PLAY", SCREEN_WIDTH / 2, 250, 0, -0.05);
+    const settings = draw_button(list, "SETTINGS", SCREEN_WIDTH / 2, 330, 1, 0.06);
+    const exit_button = draw_button(list, "EXIT", SCREEN_WIDTH / 2, 410, 2, -0.04);
+    return [play, settings, exit_button];
+}
+
+function draw_magnifier(list) {
+    const lens = make_circle(list, 120, 60, 20, 210, 235, 255, 90);
+    const rim = make_circle(list, 120, 60, 20, 230, 230, 235, 0);
+    const handle = make_rect(list, 120, 60, 10, 30, 90, 70, 40, 255);
+    return [lens, rim, handle];
+}
+
+function draw_menu(list) {
+    draw_dim_backdrop(list);
+    draw_corkboard(list);
+    const clues = draw_clues(list);
+    const title_parts = draw_title(list);
+    const buttons = draw_menu_buttons(list);
+    const magnifier = draw_magnifier(list);
+    return [buttons, title_parts, magnifier, clues];
+}
+
+let landing_selected_index = 0;
+let key_w_prev = false;
+let key_s_prev = false;
+
+const select_sound = create_audio("https://labs.phaser.io/assets/audio/SoundEffects/key.wav", 0.6);
+
+function update_landing_keyboard() {
+    const w_down = input_key_down("w");
+    const s_down = input_key_down("s");
+    const previous = landing_selected_index;
+
+    if (w_down && !key_w_prev) {
+        landing_selected_index = (landing_selected_index + 2) % 3;
+    }
+    if (s_down && !key_s_prev) {
+        landing_selected_index = (landing_selected_index + 1) % 3;
+    }
+
+    if (landing_selected_index !== previous) {
+        play_audio(select_sound);
+    }
+
+    key_w_prev = w_down;
+    key_s_prev = s_down;
+    return undefined;
+}
+
+function update_landing_mouse_hover(buttons) {
+    for (let i = 0; i < array_length(buttons); i = i + 1) {
+        const btn = buttons[i];
+        const box = btn[0];
+        const index = btn[6];
+        if (pointer_over_gameobject(box) && index !== landing_selected_index) {
+            landing_selected_index = index;
+            play_audio(select_sound);
+        }
+    }
+    return undefined;
+}
+
+// Handles Enter/Space confirm AND mouse click confirm for whichever
+// button is currently under the pointer. PLAY now leads into the
+// Character Selection screen instead of straight into the hallway.
+function handle_landing_confirm(buttons, confirmed_by_key, clicked) {
+    let confirmed_index = -1;
+
+    if (confirmed_by_key) {
+        confirmed_index = landing_selected_index;
+    }
+
+    if (clicked) {
+        for (let i = 0; i < array_length(buttons); i = i + 1) {
+            const box = buttons[i][0];
+            if (pointer_over_gameobject(box)) {
+                confirmed_index = buttons[i][6];
+            }
+        }
+    }
+
+    if (confirmed_index === 0) {
+        change_scene("char_select");
+        sync_char_select_visuals();
+    }
+    // SETTINGS (1) and EXIT (2) have no scene yet - visuals only,
+    // exactly like the rest of the menu before this was wired up.
+    return undefined;
+}
+
+function animate_menu_buttons(buttons, t) {
+    for (let i = 0; i < array_length(buttons); i = i + 1) {
+        const btn = buttons[i];
+        const box = btn[0];
+        const glow = btn[1];
+        const text = btn[2];
+        const pin = btn[3];
+        const base_scale = btn[4];
+        const base_tilt = btn[5];
+        const index = btn[6];
+
+        if (index === landing_selected_index) {
+            const pulse = 1 + 0.08 * math_sin(t * 7);
+            const straighten = base_tilt * (1 - 0.9);
+
+            update_scale(box, [pulse, pulse]);
+            update_scale(text, [base_scale * pulse, base_scale * pulse]);
+            update_rotation(box, straighten + 0.03 * math_sin(t * 4));
+            update_rotation(text, straighten + 0.03 * math_sin(t * 4));
+            update_color(box, [255, 225, 140, 255]);
+            update_color(text, [70, 45, 15, 255]);
+
+            const glow_pulse = 1.05 + 0.15 * math_sin(t * 7);
+            const glow_alpha = 140 + 70 * math_sin(t * 7);
+            update_rotation(glow, straighten);
+            update_scale(glow, [glow_pulse, glow_pulse]);
+            update_color(glow, [255, 200, 90, glow_alpha]);
+
+            update_scale(pin, [1.3, 1.3]);
+            update_color(pin, [255, 60, 60, 255]);
+        } else {
+            const idle_wobble = base_tilt + 0.02 * math_sin(t * 1.5 + index * 2);
+
+            update_scale(box, [1, 1]);
+            update_scale(text, [base_scale, base_scale]);
+            update_rotation(box, idle_wobble);
+            update_rotation(text, idle_wobble);
+            update_color(box, [245, 235, 210, 255]);
+            update_color(text, [40, 35, 30, 255]);
+
+            update_rotation(glow, idle_wobble);
+            update_scale(glow, [1, 1]);
+            update_color(glow, [255, 200, 90, 0]);
+
+            update_scale(pin, [1, 1]);
+            update_color(pin, [190, 30, 30, 255]);
+        }
+    }
+    return undefined;
+}
+
+function animate_title(title_parts, t) {
+    const title = title_parts[0];
+    const shadow = title_parts[1];
+    const x = title_parts[2];
+    const y = title_parts[3];
+
+    const bounce = 6 * math_sin(t * 2.2);
+    const wiggle = 0.03 * math_sin(t * 3);
+    const r = 200 + 55 * math_sin(t * 1.1);
+    const g = 170 + 40 * math_sin(t * 1.1 + 2);
+    const b = 70 + 40 * math_sin(t * 1.1 + 4);
+
+    update_position(title, [x, y + bounce]);
+    update_rotation(title, wiggle);
+    update_color(title, [r, g, b, 255]);
+
+    update_position(shadow, [x + 4, y + 4 + bounce]);
+    update_rotation(shadow, wiggle);
+
+    return undefined;
+}
+
+function animate_magnifier(magnifier, t) {
+    const lens = magnifier[0];
+    const rim = magnifier[1];
+    const handle = magnifier[2];
+
+    const x = SCREEN_WIDTH / 2 + 320 * math_sin(t * 0.35);
+    const y = 55 + 12 * math_sin(t * 0.9);
+    const tilt = 0.4 * math_sin(t * 0.7);
+
+    update_position(lens, [x, y]);
+    update_position(rim, [x, y]);
+
+    const handle_x = x + 26 * math_cos(tilt);
+    const handle_y = y + 26 * math_sin(tilt);
+    update_position(handle, [handle_x, handle_y]);
+    update_rotation(handle, tilt);
+    update_rotation(lens, tilt);
+    update_rotation(rim, tilt);
+
+    return undefined;
+}
+
+function animate_clues(clues, t) {
+    for (let i = 0; i < array_length(clues); i = i + 1) {
+        const clue = clues[i];
+        const card = clue[0];
+        const mark = clue[1];
+        const sway = 0.02 * math_sin(t * 1.2 + i * 1.7);
+        update_rotation(card, sway);
+        update_rotation(mark, sway);
+    }
+    return undefined;
+}
+
+// ================================================================
+//  SCENE 1.5: CHARACTER SELECTION - USING SPRITES FROM GITHUB
+//  Replaces the procedural drawings with actual PNG images.
+//  Characters are displayed at a uniform, larger size (scale 0.6).
+// ================================================================
+
+const CHAR_PREVIEW_X = SCREEN_WIDTH / 2;
+const CHAR_PREVIEW_Y = 280;
+
+// Character record layout (plain array, named index constants):
+const CH_NAME = 0;
+const CH_DESC = 1;
+const CH_ALL_PARTS = 2;    // [[obj,r,g,b], ...] - every visual part (for whole-character show/hide)
+const CH_SHADOW = 3;       // soft shadow obj underneath
+const CH_BODY = 4;         // torso/coat obj (breathing)
+const CH_HEAD = 5;         // head obj (bob)
+const CH_EYE_L = 6;        // left eye (blink)
+const CH_EYE_R = 7;        // right eye (blink)
+const CH_HAT = 8;          // hat/hood obj (bob with head)
+const CH_COAT_FLAPS = 9;   // [[obj,baseX,baseY,baseRot], ...] - coat/hood sway
+const CH_ACCESSORIES = 10; // [[obj,baseX,baseY,kind,phase], ...] - accessory animation
+const CH_SPRITE = 11;      // sprite object for image-based characters
+
+let characters = [];
+let char_select_index = 0;         // currently browsed character while choosing
+let selected_character_index = 0;  // confirmed choice, used for the rest of the game
+
+// Base URL for your character images - USING RAW GITHUB URL
+const CHAR_IMAGE_BASE = "https://raw.githubusercontent.com/khanakaggarwal1204/Operation-Escape/main/assets/characters/";
+
+// Helper to register a sprite in a scene list (doesn't use color storage)
+function reg_sprite(list, sprite) {
+    if (list !== undefined) {
+        // Store sprite with placeholder color values that won't be used
+        list[array_length(list)] = [sprite, 255, 255, 255, 255];
+    }
+    return sprite;
+}
+
+// Helper to create a character sprite
+function create_character_sprite(list, imageName, displayName, description) {
+    // Create the main sprite
+    const sprite = create_sprite(CHAR_IMAGE_BASE + imageName);
+    // Scale it to fit the preview area well - UNIFORM LARGER SIZE
+    update_scale(sprite, [0.6, 0.6]); // Increased from 0.3 to 0.6
+    update_position(sprite, [CHAR_PREVIEW_X, CHAR_PREVIEW_Y]);
+    
+    // Add to scene list for hiding/showing
+    reg_sprite(list, sprite);
+    
+    // Create a visual record similar to the old system for compatibility
+    const record = [];
+    record[CH_NAME] = displayName;
+    record[CH_DESC] = description;
+    record[CH_SPRITE] = sprite;
+    // For CH_ALL_PARTS, store the sprite as a special entry
+    // Since sprites don't use color, we store the sprite directly
+    record[CH_ALL_PARTS] = [[sprite, 255, 255, 255]];
+    record[CH_SHADOW] = null;
+    record[CH_BODY] = sprite;
+    record[CH_HEAD] = sprite;
+    record[CH_EYE_L] = null;
+    record[CH_EYE_R] = null;
+    record[CH_HAT] = sprite;
+    record[CH_COAT_FLAPS] = [];
+    record[CH_ACCESSORIES] = [];
+    
+    return record;
+}
+
+// ---- Character 1: Classic Detective ----
+function create_classic_detective(list) {
+    return create_character_sprite(list, "CLASSIC_DETECTIVE.png", "Classic Detective", "A sharp-eyed sleuth with a trusty coat and magnifying glass.");
+}
+
+// ---- Character 2: Ghost Hunter ----
+function create_ghost_hunter(list) {
+    return create_character_sprite(list, "GHOST_HUNTER.png", "Ghost Hunter", "Cloaked in shadow, armed with a lantern and silver cross.");
+}
+
+// ---- Character 3: Archaeologist ----
+function create_archaeologist(list) {
+    return create_character_sprite(list, "ARCHAEOLOGIST.png", "Archaeologist", "A seasoned explorer with a satchel full of secrets.");
+}
+
+// ---- Character 4: Shadow Investigator ----
+function create_shadow_investigator(list) {
+    return create_character_sprite(list, "SHADOW_INVESTIGATOR.png", "Shadow Investigator", "A hooded figure who moves unseen and speaks little.");
+}
+
+// ---- Character 5: Robot Detective ----
+function create_robot_detective(list) {
+    return create_character_sprite(list, "ROBOT_INVESTIGATOR.png", "Robot Detective", "A robotic sleuth with advanced scanning capabilities.");
+}
+
+// ---- UI: background, title, per-character name/description (fixed
+//      text, alpha toggled like the dialogue system), instructions, and
+//      clickable left/right arrow buttons.
+//
+//  draw_char_select_background() is deliberately its OWN function,
+//  separate from draw_char_select_ui(), and is called from the
+//  assembly section BEFORE the characters are created. This engine
+//  layers objects in creation order (later-created draws on top of
+//  earlier-created), so the opaque full-screen backdrop must exist
+//  first, otherwise it paints over every character and hides them
+//  entirely. draw_char_select_ui() (title/instructions/name/desc
+//  text/arrows) is still called AFTER the characters, so that UI
+//  correctly stays on top of them.
+// ----------------------------------------------------------------
+let char_name_texts = [];
+let char_desc_texts = [];
+let char_left_arrow = null;
+let char_right_arrow = null;
+
+function draw_char_select_background(list) {
+    make_rect(list, SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2, SCREEN_WIDTH, SCREEN_HEIGHT, 12, 10, 16, 255);
+    return undefined;
+}
+
+function draw_char_select_ui(list) {
+    make_text(list, SCREEN_WIDTH / 2, 55, "CHOOSE YOUR DETECTIVE", 1.3, 230, 195, 90, 255);
+    make_text(list, SCREEN_WIDTH / 2, 565, "\u2190 / \u2192 to browse  -  ENTER to select  -  ESC to go back", 0.55, 200, 195, 180, 220);
+
+    for (let i = 0; i < array_length(characters); i = i + 1) {
+        const record = characters[i];
+        char_name_texts[i] = make_text(list, SCREEN_WIDTH / 2, 470, record[CH_NAME], 1.1, 235, 225, 200, 0);
+        char_desc_texts[i] = make_text(list, SCREEN_WIDTH / 2, 505, record[CH_DESC], 0.65, 210, 205, 220, 0);
+    }
+
+    char_left_arrow = make_triangle(list, 90, CHAR_PREVIEW_Y, 40, 60, 220, 200, 140, 255);
+    update_rotation(char_left_arrow, -math_PI / 2);
+    char_right_arrow = make_triangle(list, SCREEN_WIDTH - 90, CHAR_PREVIEW_Y, 40, 60, 220, 200, 140, 255);
+    update_rotation(char_right_arrow, math_PI / 2);
+
+    return undefined;
+}
+
+function set_all_parts_alpha(all_parts, alpha) {
+    for (let i = 0; i < array_length(all_parts); i = i + 1) {
+        const p = all_parts[i];
+        // For sprites, we use update_color to control alpha
+        // The color values stored are just placeholders
+        update_color(p[0], [p[1], p[2], p[3], alpha]);
+    }
+    return undefined;
+}
+
+// Re-applies which single character is visible. Called right after
+// this scene becomes active (undoes show_scene()'s uniform alpha
+// restore) and again every time the browsed index changes.
+function sync_char_select_visuals() {
+    for (let i = 0; i < array_length(characters); i = i + 1) {
+        const on = i === char_select_index;
+        set_all_parts_alpha(characters[i][CH_ALL_PARTS], on ? 255 : 0);
+        update_color(char_name_texts[i], [235, 225, 200, on ? 255 : 0]);
+        update_color(char_desc_texts[i], [210, 205, 220, on ? 255 : 0]);
+    }
+    return undefined;
+}
+
+function next_character() {
+    char_select_index = (char_select_index + 1) % array_length(characters);
+    sync_char_select_visuals();
+    return undefined;
+}
+
+function previous_character() {
+    char_select_index = (char_select_index + array_length(characters) - 1) % array_length(characters);
+    sync_char_select_visuals();
+    return undefined;
+}
+
+// select_character() - confirms the browsed character as the pick
+// for the rest of the session, applies it to the Room 1 avatar, and
+// starts the smooth fade into the hallway.
+function select_character() {
+    selected_character_index = char_select_index;
+    spawn_selected_character();
+    start_char_select_fade();
+    return undefined;
+}
+
+let char_left_prev = false;
+let char_right_prev = false;
+
+function update_char_select_input(confirmed, clicked) {
+    const left_down = input_key_down("ArrowLeft");
+    const right_down = input_key_down("ArrowRight");
+
+    if (left_down && !char_left_prev) { previous_character(); }
+    if (right_down && !char_right_prev) { next_character(); }
+    char_left_prev = left_down;
+    char_right_prev = right_down;
+
+    if (clicked) {
+        if (pointer_over_gameobject(char_left_arrow)) { previous_character(); }
+        if (pointer_over_gameobject(char_right_arrow)) { next_character(); }
+    }
+
+    if (confirmed) {
+        select_character();
+    }
+
+    return undefined;
+}
+
+function animate_char_select_arrows(t) {
+    const pulse_l = 1 + 0.08 * math_sin(t * 3);
+    const pulse_r = 1 + 0.08 * math_sin(t * 3 + math_PI);
+    update_scale(char_left_arrow, [pulse_l, pulse_l]);
+    update_scale(char_right_arrow, [pulse_r, pulse_r]);
+    return undefined;
+}
+
+// ----------------------------------------------------------------
+//  animate_character() - shared animation routine for sprite-based
+//  characters: idle breathing, blinking via scale.
+//  Uses the same uniform scale (0.6) for all characters.
+// ----------------------------------------------------------------
+function animate_character(record, t, loop_count) {
+    const sprite = record[CH_SPRITE];
+    if (sprite === null || sprite === undefined) {
+        return undefined;
+    }
+    
+    // Idle breathing / bobbing motion
+    const breathe = 1 + 0.025 * math_sin(t * 1.6);
+    const bobY = 4 * math_sin(t * 1.6);
+    update_position(sprite, [CHAR_PREVIEW_X, CHAR_PREVIEW_Y + bobY]);
+    update_scale(sprite, [0.6 * breathe, 0.6 * breathe]); // Uniform scale 0.6
+    
+    // Blinking effect: quickly scale the sprite's y
+    const period_frames = 4 * FPS;
+    const blink_frames = math_round(0.12 * FPS);
+    const cycle_pos = loop_count % period_frames;
+    const blink_scale_y = (cycle_pos < blink_frames) ? 0.1 : 1;
+    update_scale(sprite, [0.6 * breathe, 0.6 * breathe * blink_scale_y]); // Uniform scale 0.6
+    
+    return undefined;
+}
+
+// ----------------------------------------------------------------
+//  Smooth fade transition from Character Selection into the hallway.
+//  Same "fade rect not registered to any scene" trick used by the
+//  Room 1 door fade, kept independent from it since it spans a
+//  different pair of scenes.
+// ----------------------------------------------------------------
+let char_select_fade_rect = null;
+let char_select_fade_state = "none"; // "none" | "out" | "in"
+let char_select_fade_timer = 0;
+const CHAR_SELECT_FADE_FRAMES = math_round(0.5 * FPS);
+
+function start_char_select_fade() {
+    char_select_fade_state = "out";
+    char_select_fade_timer = 0;
+    return undefined;
+}
+
+function update_char_select_fade() {
+    if (char_select_fade_state === "out") {
+        char_select_fade_timer = char_select_fade_timer + 1;
+        const p = math_min(1, char_select_fade_timer / CHAR_SELECT_FADE_FRAMES);
+        update_color(char_select_fade_rect, [0, 0, 0, 255 * p]);
+        if (p >= 1) {
+            change_scene("room_select");
+            sync_room_select_visuals(hallway_doors);
+            char_select_fade_state = "in";
+            char_select_fade_timer = 0;
+        }
+    } else if (char_select_fade_state === "in") {
+        char_select_fade_timer = char_select_fade_timer + 1;
+        const p = math_min(1, char_select_fade_timer / CHAR_SELECT_FADE_FRAMES);
+        update_color(char_select_fade_rect, [0, 0, 0, 255 * (1 - p)]);
+        if (p >= 1) {
+            char_select_fade_state = "none";
+        }
+    }
+    return undefined;
+}
+
+// ----------------------------------------------------------------
+//  Applying the chosen character to the Room 1 avatar. The engine
+//  has no sprite-swap, so the same procedurally-built player circle
+//  set is recolored to match the chosen character's coat/hat, and
+//  a small signature-accessory glow (lantern/cross/torch/mystery/
+//  scanner) follows the player around, so the choice is visibly
+//  carried into every future room.
+// ----------------------------------------------------------------
+const CHAR_BODY_COLORS = [[92, 60, 33], [32, 30, 42], [150, 120, 70], [12, 11, 15], [180, 180, 190]];
+const CHAR_HAT_COLORS = [[55, 36, 20], [20, 18, 28], [130, 100, 55], [6, 5, 9], [255, 200, 50]];
+const CHAR_ACCESSORY_COLORS = [[255, 200, 100], [180, 200, 255], [255, 170, 60], [150, 80, 190], [0, 200, 255]];
+
+let room1_character_accessory_objs = []; // one small signature-accessory glow per character
+
+// draw_room1_character_accessories() - pre-makes every signature
+// accessory glow near the Room 1 player, alpha 0 until the matching
+// character is selected (see spawn_selected_character()).
+function draw_room1_character_accessories(list) {
+    for (let i = 0; i < array_length(CHAR_ACCESSORY_COLORS); i = i + 1) {
+        const c = CHAR_ACCESSORY_COLORS[i];
+        room1_character_accessory_objs[i] = make_circle(list, room1_player_x + 20, room1_player_y + 5, 8, c[0], c[1], c[2], 0);
+    }
+    return undefined;
+}
+
+// spawn_selected_character() - recolors the existing Room 1 player
+// avatar (body/hat) to match the chosen character, and reveals that
+// character's signature accessory glow while hiding the others.
+function spawn_selected_character() {
+    const idx = selected_character_index;
+    const body_col = CHAR_BODY_COLORS[idx];
+    const hat_col = CHAR_HAT_COLORS[idx];
+
+    update_color(room1_player_parts[0][0], [body_col[0], body_col[1], body_col[2], 255]);
+    update_color(room1_player_parts[2][0], [hat_col[0], hat_col[1], hat_col[2], 255]);
+
+    for (let i = 0; i < array_length(room1_character_accessory_objs); i = i + 1) {
+        update_color(room1_character_accessory_objs[i], [0, 0, 0, 0]);
+    }
+    const c = CHAR_ACCESSORY_COLORS[idx];
+    update_color(room1_character_accessory_objs[idx], [c[0], c[1], c[2], 220]);
+
+    return undefined;
+}
+
+// Keeps the signature accessory glow glued to the player's position
+// every frame (called from the Room 1 branch of the main loop).
+function update_character_accessory_position(offset_x, offset_y) {
+    for (let i = 0; i < array_length(room1_character_accessory_objs); i = i + 1) {
+        update_position(room1_character_accessory_objs[i], [room1_player_x + offset_x, room1_player_y + offset_y]);
+    }
+    return undefined;
+}
+
+// Small idle glow pulse on whichever accessory is currently visible.
+function animate_character_accessory(t) {
+    const obj = room1_character_accessory_objs[selected_character_index];
+    const pulse = 1 + 0.15 * math_sin(t * 3);
+    update_scale(obj, [pulse, pulse]);
+    return undefined;
+}
+
+// ================================================================
+//  SCENE 2: ROOM SELECT (mysterious hallway, 4 doors)
+// ================================================================
+
+// Simple corridor: floor + back wall + tapered side wall strips to
+// suggest a hallway receding into the distance (arcade_2d only has
+// rectangles/circles/triangles, so the "perspective" is approximated
+// with triangles along each side instead of a true trapezoid).
+function draw_hallway(list) {
+    make_rect(list, SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2, SCREEN_WIDTH, SCREEN_HEIGHT, 30, 28, 34, 255);
+
+    // floor
+    make_rect(list, SCREEN_WIDTH / 2, 540, SCREEN_WIDTH, 120, 50, 35, 25, 255);
+    for (let plank = 0; plank < 9; plank = plank + 1) {
+        make_rect(list, 20 + plank * 90, 540, 4, 120, 35, 24, 16, 255);
+    }
+
+    // ceiling shadow band
+    make_rect(list, SCREEN_WIDTH / 2, 40, SCREEN_WIDTH, 60, 18, 17, 20, 255);
+
+    // side wall perspective wedges (suggests the hallway narrowing away)
+    make_triangle(list, 60, 300, 160, 480, 22, 20, 25, 255);
+    make_triangle(list, SCREEN_WIDTH - 60, 300, 160, 480, 22, 20, 25, 255);
+
+    // faint stone seams on the back wall
+    for (let row = 0; row < 4; row = row + 1) {
+        make_rect(list, SCREEN_WIDTH / 2, 90 + row * 70, SCREEN_WIDTH, 2, 20, 19, 22, 150);
+    }
+
+    return undefined;
+}
+
+function draw_torch(list, x, y, phase) {
+    const bracket = make_rect(list, x, y + 10, 14, 24, 40, 30, 20, 255);
+    const glow = make_circle(list, x, y - 34, 40, 255, 150, 50, 70);
+    const flame_outer = make_triangle(list, x, y - 32, 16, 26, 255, 120, 30, 255);
+    const flame_inner = make_triangle(list, x, y - 38, 9, 14, 255, 210, 90, 255);
+    return [flame_outer, flame_inner, glow, phase];
+}
+
+function create_fog(list, count) {
+    const fog = [];
+    for (let i = 0; i < count; i = i + 1) {
+        const base_y = 505 + math_random() * 40;
+        const start_x = math_random() * SCREEN_WIDTH;
+        const speed = 6 + math_random() * 10;
+        const width = 160 + math_random() * 140;
+        const puff = make_rect(list, start_x, base_y, width, 30, 210, 205, 200, 35);
+        fog[i] = [puff, base_y, speed, start_x];
+    }
+    return fog;
+}
+
+function create_light_rays(list, count) {
+    const rays = [];
+    for (let i = 0; i < count; i = i + 1) {
+        const x = 120 + i * (SCREEN_WIDTH - 240) / (count - 1 === 0 ? 1 : count - 1);
+        const ray = make_triangle(list, x, 130, 50, 260, 255, 250, 210, 25);
+        rays[i] = [ray, x, math_random() * 10];
+    }
+    return rays;
+}
+
+// Small padlock icon: circle "shackle" peeking out from behind a
+// rounded body rectangle, plus a tiny keyhole dot.
+function draw_lock(list, x, y) {
+    const shackle = make_circle(list, x, y - 10, 8, 40, 40, 45, 255);
+    const body = make_rect(list, x, y, 22, 18, 210, 175, 60, 255);
+    const keyhole = make_circle(list, x, y + 1, 2.5, 40, 30, 15, 255);
+    return [shackle, body, keyhole];
+}
+
+// Returns a door record:
+// [creak_parts, x, y, state, index, frame_box, label_obj, lock_parts,
+//  unlocked_glow, status_text]
+// state is one of "unlocked" | "locked" | "secret"
+function draw_door(list, x, y, state, index, label) {
+    const parts = [];
+    let n = 0;
+    const track_part = (obj, px, py) => {
+        parts[n] = [obj, px, py];
+        n = n + 1;
+        return obj;
+    };
+
+    const frame_box = track_part(make_rect(list, x, y, 130, 220, 45, 40, 46, 255), x, y);
+
+    if (state === "secret") {
+        // Mostly covered by an old bookshelf/curtain - just barely
+        // visible so sharp-eyed players can suspect something's there.
+        track_part(make_rect(list, x, y, 116, 200, 40, 30, 24, 255), x, y);
+        for (let shelf = 0; shelf < 4; shelf = shelf + 1) {
+            track_part(make_rect(list, x, y - 80 + shelf * 55, 110, 8, 25, 18, 14, 255), x, y - 80 + shelf * 55);
+        }
+        for (let book = 0; book < 6; book = book + 1) {
+            const bx = x - 45 + book * 18;
+            const bcol_r = 60 + math_random() * 80;
+            const bcol_g = 30 + math_random() * 40;
+            const bcol_b = 20 + math_random() * 30;
+            track_part(make_rect(list, bx, y - 60, 14, 45, bcol_r, bcol_g, bcol_b, 255), bx, y - 60);
+        }
+    } else {
+        track_part(make_rect(list, x, y, 110, 200, 70, 45, 25, 255), x, y);
+        track_part(make_rect(list, x, y - 45, 80, 60, 60, 38, 20, 255), x, y - 45);
+        track_part(make_rect(list, x, y + 45, 80, 60, 60, 38, 20, 255), x, y + 45);
+        track_part(make_circle(list, x + 35, y, 5, 20, 20, 22, 255), x + 35, y);
+    }
+
+    const label_obj = make_text(list, x, y + 130, label, 0.75, 230, 220, 200, 255);
+
+    let lock_parts = [];
+    if (state === "locked") {
+        lock_parts = draw_lock(list, x, y);
+        make_text(list, x, y + 150, "LOCKED", 0.6, 220, 90, 80, 255);
+    }
+
+    // A soft glow ring that only appears once a door becomes newly
+    // unlocked at runtime (see unlock_room2()/sync_room_select_visuals()).
+    const unlocked_glow = make_circle(list, x, y, 80, 255, 220, 120, 0);
+    // Reusable status line under the label - shows "Unlocked" once a
+    // previously-locked door opens, or "Completed (check)" for a
+    // finished room. Empty string at creation; content is picked at
+    // runtime by choosing which status text object to reveal instead
+    // (see room_status_texts below), since text content can't change.
+    const status_text = null;
+
+    return [parts, x, y, state, index, frame_box, label_obj, lock_parts, unlocked_glow, status_text];
+}
+
+function draw_room_select_doors(list) {
+    const y = 320;
+    const spacing = 175;
+    const start_x = SCREEN_WIDTH / 2 - spacing * 1.5;
+
+    const door1 = draw_door(list, start_x, y, "unlocked", 0, "ROOM 1");
+    const door2 = draw_door(list, start_x + spacing, y, "locked", 1, "ROOM 2");
+    const door3 = draw_door(list, start_x + spacing * 2, y, "locked", 2, "ROOM 3");
+    const door4 = draw_door(list, start_x + spacing * 3, y, "secret", 3, "");
+
+    return [door1, door2, door3, door4];
+}
+
+// Pre-made "Unlocked" / "Completed [check]" status labels placed under
+// each door, one pair per door index, alpha 0 until that door's state
+// changes at runtime (see sync_room_select_visuals()).
+let room_status_unlocked_texts = [];
+let room_status_completed_texts = [];
+
+function draw_room_status_labels(list, doors) {
+    for (let i = 0; i < array_length(doors); i = i + 1) {
+        const door = doors[i];
+        const x = door[1];
+        const y = door[2];
+        room_status_unlocked_texts[i] = make_text(list, x, y + 150, "Unlocked", 0.6, 140, 230, 140, 0);
+        room_status_completed_texts[i] = make_text(list, x, y + 150, "Completed \u2713", 0.6, 255, 210, 90, 0);
+    }
+    return undefined;
+}
+
+// Big banner shown briefly above Room 2's door the moment it
+// becomes unlocked (see unlock_room2() / update_room2_unlock_banner()).
+let room2_unlock_banner = null;
+let room2_unlock_banner_until = -1;
+
+function draw_room2_unlock_banner(list, doors) {
+    const door2 = doors[1];
+    room2_unlock_banner = make_text(list, door2[1], door2[2] - 165, "Room 2 Unlocked!", 0.7, 140, 230, 140, 0);
+    return undefined;
+}
+
+function draw_room_select(list) {
+    draw_hallway(list);
+
+    const rays = create_light_rays(list, 3);
+    const fog = create_fog(list, 5);
+    const dust = create_dust(list, 12, 120, 480);
+
+    const torch_1 = draw_torch(list, 90, 250, 0);
+    const torch_2 = draw_torch(list, SCREEN_WIDTH - 90, 250, 2.4);
+    const torches = [torch_1, torch_2];
+
+    const doors = draw_room_select_doors(list);
+    draw_room_status_labels(list, doors);
+    draw_room2_unlock_banner(list, doors);
+
+    make_text(list, SCREEN_WIDTH / 2, 500, "Choose a room  -  A / D or click, Enter to open, ESC to go back", 0.55, 200, 195, 180, 220);
+
+    return [doors, torches, fog, rays, dust];
+}
+
+// -- animation ------------------------------------------------------
+function animate_hallway(torches, fog, rays, t) {
+    for (let i = 0; i < array_length(torches); i = i + 1) {
+        const c = torches[i];
+        const flame_outer = c[0];
+        const flame_inner = c[1];
+        const glow = c[2];
+        const phase = c[3];
+
+        const flicker = 0.85 + 0.12 * math_sin(t * 10 + phase) + 0.06 * math_sin(t * 21 + phase * 1.5);
+        update_scale(flame_outer, [flicker, flicker]);
+        update_scale(flame_inner, [flicker * 1.05, flicker * 0.95]);
+        update_scale(glow, [0.85 + 0.15 * math_sin(t * 6 + phase), 0.85 + 0.15 * math_sin(t * 6 + phase)]);
+    }
+
+    for (let i = 0; i < array_length(fog); i = i + 1) {
+        const f = fog[i];
+        const puff = f[0];
+        const base_y = f[1];
+        const speed = f[2];
+        const start_x = f[3];
+        const x = (start_x + t * speed) % (SCREEN_WIDTH + 200) - 100;
+        update_position(puff, [x, base_y]);
+    }
+
+    for (let i = 0; i < array_length(rays); i = i + 1) {
+        const r = rays[i];
+        const ray = r[0];
+        const base_x = r[1];
+        const phase = r[2];
+        const drift = 10 * math_sin(t * 0.2 + phase);
+        const alpha = 18 + 12 * math_sin(t * 0.5 + phase);
+        update_position(ray, [base_x + drift, 130]);
+        update_color(ray, [255, 250, 210, alpha]);
+    }
+
+    return undefined;
+}
+
+// Pulses the "Room 2 Unlocked!" banner above the hallway door while
+// its temporary display window is active, then fades it away.
+function update_room2_unlock_banner(loop_count) {
+    if (room2_unlock_banner === null) {
+        return undefined;
+    }
+    if (loop_count < room2_unlock_banner_until) {
+        const pulse = 200 + 55 * math_sin(loop_count / FPS * 4);
+        update_color(room2_unlock_banner, [140, 230, 140, pulse]);
+    } else {
+        update_color(room2_unlock_banner, [140, 230, 140, 0]);
+    }
+    return undefined;
+}
+
+let deny_flash_until = [-1, -1, -1, -1];
+
+// ---- room-select persistent progress (survives scene switches for
+//      the rest of the current game session) -----------------------
+// room_completed[i] / room_unlocked[i] mirror the door states shown
+// in the hallway. Room 1 starts unlocked+incomplete; the rest start
+// locked. Completing room1 flips room_completed[0] and
+// room_unlocked[1], which sync_room_select_visuals() then reflects.
+let room_completed = [false, false, false, false];
+let room_unlocked = [true, false, false, false];
+
+// Set to true the moment Room 2 becomes unlocked, and consumed the
+// next time the hallway is (re)entered - that's when the door glow
+// flash + "Room 2 Unlocked!" banner actually get triggered, rather
+// than firing instantly while the player is still inside Room 1.
+let pending_room2_announcement = false;
+
+// ----------------------------------------------------------------
+//  complete_room(index) / unlock_room2() - the two helpers that
+//  wire the escape room's completion into the hallway's persistent
+//  state. Called once, right when the Room 1 door-fade finishes
+//  (see update_door_fade()).
+// ----------------------------------------------------------------
+function complete_room(index) {
+    room_completed[index] = true;
+    if (index === 0) {
+        unlock_room2();
+    }
+    return undefined;
+}
+
+function unlock_room2() {
+    room_unlocked[1] = true;
+    pending_room2_announcement = true;
+    return undefined;
+}
+
+// Re-applies room_completed/room_unlocked to the hallway door visuals.
+// Called whenever the hallway becomes the active scene again, since
+// hide_scene()/show_scene() alone can't change which status label
+// or lock icon is showing.
+function sync_room_select_visuals(doors) {
+    for (let i = 0; i < array_length(doors); i = i + 1) {
+        const door = doors[i];
+        const lock_parts = door[7];
+        const unlocked = room_unlocked[i];
+        const completed = room_completed[i];
+
+        for (let p = 0; p < array_length(lock_parts); p = p + 1) {
+            // draw_lock() returns raw game objects [shackle, body, keyhole],
+            // NOT [obj, x, y] pairs like door creak parts.
+            update_color(lock_parts[p], [
+                p === 1 ? 210 : 40,
+                p === 1 ? 175 : (p === 0 ? 40 : 30),
+                p === 1 ? 60 : (p === 0 ? 45 : 15),
+                unlocked ? 0 : 255
+            ]);
+        }
+
+        update_color(room_status_unlocked_texts[i], [140, 230, 140, unlocked && !completed && i !== 0 ? 255 : 0]);
+        update_color(room_status_completed_texts[i], [255, 210, 90, completed ? 255 : 0]);
+    }
+    return undefined;
+}
+
+let door_unlock_flash_until = -1;
+
+function animate_door(door, t, loop_count, hovered) {
+    const parts = door[0];
+    const state = door[3];
+    const index = door[4];
+    const frame_box = door[5];
+    const unlocked_glow = door[8];
+
+    // gentle periodic creak, staggered per door so they never all
+    // creak in sync (avoids the "everything moves at once" clutter)
+    const period_frames = 7 * FPS;
+    const stagger = index * 45;
+    const cycle_pos = (loop_count + stagger) % period_frames;
+    const creak_frames = math_round(0.4 * FPS);
+    const creak = cycle_pos < creak_frames
+        ? 0.06 * (1 - cycle_pos / creak_frames) * math_sin(cycle_pos * 3)
+        : 0;
+
+    for (let i = 0; i < array_length(parts); i = i + 1) {
+        update_rotation(parts[i][0], creak);
+    }
+
+    const denied = loop_count < deny_flash_until[index];
+
+    if (denied) {
+        const shake = 5 * math_sin(loop_count * 3);
+        update_position(frame_box, [door[1] + shake, door[2]]);
+        update_color(frame_box, [220, 60, 50, 255]);
+    } else if (hovered) {
+        update_position(frame_box, [door[1], door[2]]);
+        update_color(frame_box, [90, 80, 60, 255]);
+    } else {
+        update_position(frame_box, [door[1], door[2]]);
+        update_color(frame_box, [45, 40, 46, 255]);
+    }
+
+    // Freshly-unlocked doors (index 1 right after Room 1 completes)
+    // get a brief golden glow pulse so the player notices the change.
+    if (index === 1 && loop_count < door_unlock_flash_until) {
+        const glow_pulse = 1 + 0.25 * math_sin(t * 6);
+        const glow_alpha = 90 + 60 * math_sin(t * 6);
+        update_scale(unlocked_glow, [glow_pulse, glow_pulse]);
+        update_color(unlocked_glow, [255, 220, 120, glow_alpha]);
+    } else if (room_unlocked[index] && index !== 0) {
+        const glow_alpha = 35 + 15 * math_sin(t * 2 + index);
+        update_scale(unlocked_glow, [1, 1]);
+        update_color(unlocked_glow, [255, 220, 120, glow_alpha]);
+    } else {
+        update_color(unlocked_glow, [255, 220, 120, 0]);
+    }
+
+    return undefined;
+}
+
+let room_a_prev = false;
+let room_d_prev = false;
+let room_selected_index = 0;
+
+function update_room_selection_keyboard() {
+    const a_down = input_key_down("a") || input_key_down("ArrowLeft");
+    const d_down = input_key_down("d") || input_key_down("ArrowRight");
+
+    if (a_down && !room_a_prev) {
+        room_selected_index = (room_selected_index + 3) % 4;
+    }
+    if (d_down && !room_d_prev) {
+        room_selected_index = (room_selected_index + 1) % 4;
+    }
+
+    room_a_prev = a_down;
+    room_d_prev = d_down;
+    return undefined;
+}
+
+function update_room_selection_mouse(doors) {
+    for (let i = 0; i < array_length(doors); i = i + 1) {
+        const door = doors[i];
+        if (pointer_over_gameobject(door[5])) {
+            room_selected_index = door[4];
+        }
+    }
+    return undefined;
+}
+
+// Confirms the current selection (Enter/Space, or a direct click on
+// a door). Unlocked -> go to Room 1. Locked -> brief red "denied"
+// flash. Secret -> stays inert for now (no puzzles/gameplay yet).
+function handle_room_selection(doors, confirmed_by_key, clicked, loop_count) {
+    let confirmed_index = -1;
+
+    if (confirmed_by_key) {
+        confirmed_index = room_selected_index;
+    }
+    if (clicked) {
+        for (let i = 0; i < array_length(doors); i = i + 1) {
+            if (pointer_over_gameobject(doors[i][5])) {
+                confirmed_index = doors[i][4];
+            }
+        }
+    }
+
+    if (confirmed_index === -1) {
+        return undefined;
+    }
+
+    const door = doors[confirmed_index];
+    const state = door[3];
+    // Room 2's door starts life as "locked" visually, but once
+    // unlock_room2() flips room_unlocked[1] we still want it to open
+    // like an unlocked door rather than flash red.
+    const effectively_unlocked = state === "unlocked" || room_unlocked[confirmed_index];
+
+    if (effectively_unlocked) {
+        if (confirmed_index === 0) {
+            enter_room1();
+        } else if (confirmed_index === 1) {
+            enter_room2();
+        }
+        // Room 3 has no scene built yet - unlocking just changes its
+        // look for now; entering it is out of scope here.
+    } else if (state === "locked") {
+        deny_flash_until[confirmed_index] = loop_count + math_round(0.5 * FPS);
+    }
+    // "secret" does nothing yet - it's just atmosphere for now.
+
+    return undefined;
+}
+
+// ================================================================
+//  SCENE 3: ROOM 1 - THE DETECTIVE'S STUDY (puzzle-gated escape room)
+//
+//  Progression:
+//    DESK puzzle (a riddle whose answer is CASE)
+//      -> drawer opens, clue found, painting puzzle unlocked
+//    PAINTING puzzle (a numeric cipher decodes to MOON)
+//      -> painting slides aside with a click, hidden wall switch appears
+//    SWITCH (walk up, "Press E to Toggle Switch", flip animation)
+//      -> mechanism activates, room shakes, bookshelf unlocked
+//    BOOKSHELF puzzle (press the books in the order a case is built:
+//      motive, then evidence, then suspect, then verdict)
+//      -> shelf slides open, reveals a hidden compartment + locked
+//         treasure chest
+//    CHEST (walk up, interact - lock clicks open, lid animates open)
+//      -> golden key reward animation plays (glow/sparkles/rays,
+//         "ROOM KEY FOUND!", ~2-3s, movement locked)
+//    KEY
+//      -> "Press E" collects it into the inventory, room1 completes
+//    DOOR
+//      -> with key: "Press E to Unlock Door", opening animation,
+//         fade to black, "Room 1 Complete", back to the hallway
+//      -> without key: "The door is locked."
+//    Returning to the hallway: Room 2 shows "Unlocked", Room 1 shows
+//    "Completed (check)".
+// ================================================================
+
+// ---- persistent room state (survives leaving/re-entering room1) --
+const ST_DESK = 0;       // false / true (solved -> drawer open)
+const ST_PAINTING = 1;   // false / true (solved -> slid aside)
+const ST_SWITCH = 2;     // false / true (flipped)
+const ST_BOOKSHELF = 3;  // false / true (solved -> slid aside)
+const ST_SAFE = 4;       // false / true (chest unlocked)
+const ST_CHEST_OPEN = 5; // false / true (chest lid opened -> key spawns)
+const ST_KEY = 6;        // false / true (collected)
+const ST_DOOR = 7;       // false / true (unlocked)
+let room1_state = [false, false, false, false, false, false, false, false];
+
+// player_has_room1_key mirrors room1_state[ST_KEY] as a plain named
+// boolean, exactly as requested - kept in sync inside collect_key().
+let player_has_room1_key = false;
+
+// ---- player ---------------------------------------------------
+let room1_player_x = 400;
+let room1_player_y = 500;
+const PLAYER_RADIUS = 14;
+const PLAYER_SPEED = 3.4;
+
+const ROOM1_MIN_X = 65;
+const ROOM1_MAX_X = 735;
+// Raised so the player can actually walk up to every back-wall
+// piece of furniture (painting, window, curtain, bookshelf)
+// instead of being stuck several tiles away on the floor.
+const ROOM1_MIN_Y = 235;
+const ROOM1_MAX_Y = 575;
+
+let room1_blocking_rects = []; // [x, y, w, h, tag]
+let room1_player_parts = [];   // [obj, offsetX, offsetY]
+
+// ---- interactables ----------------------------------------------
+// Each entry: [name, x, y, range, ring_obj, visible_fn, prompt_label]
+let room1_interactables = [];
+let room1_nearest_name = "";
+let room1_nearest_prompt = "Press E to Inspect";
+
+function always_visible() { return true; }
+
+// FIX: "painting" and "switch" are registered at the identical (x,y).
+// Previously painting used always_visible(), so once the switch
+// became visible it could never win the nearest-interactable tie
+// (see update_room1_highlights()) because painting was registered
+// first and the comparison is a strict "<". painting_visible() now
+// turns the painting interactable OFF as soon as its puzzle is
+// solved, handing the spot cleanly over to the switch.
+function painting_visible() { return !room1_state[ST_PAINTING]; }
+
+function switch_visible() { return room1_state[ST_PAINTING]; }
+
+// FIX: same tie problem between "chest" and "key" (both at 175,430).
+// chest_visible() now turns off once the chest has been unlocked,
+// handing the spot over to the key interactable.
+function chest_visible() { return room1_state[ST_BOOKSHELF] && !room1_state[ST_SAFE]; }
+
+function key_visible() { return room1_state[ST_CHEST_OPEN] && !room1_state[ST_KEY]; }
+
+// ---- dialogue system (fixed set of pre-made texts, toggled) ------
+// Used only for simple flavour objects (carpet/curtain/window) that
+// are not gated behind a puzzle. Each entry is now
+// [key, title_obj, line1_obj, line2_obj] so every clue can show a
+// bold-ish heading plus up to two wrapped lines of body text.
+let room1_dialogue_texts = [];
+let room1_dialogue_timer = 0;
+const DIALOGUE_FRAMES = 220; // generous fallback auto-dismiss time
+let room1_dialogue_box = null;
+let room1_dialogue_continue = null; // "Press SPACE to continue" prompt
+
+// ---- special sprites that need dynamic visibility ----------------
+let room1_switch_sprite = null;
+let room1_switch_glow = null;
+let room1_switch_lever = null; // the part that physically toggles
+let room1_chest_parts = [];    // chest body/lid, revealed once bookshelf slides
+let room1_chest_lid = null;
+let room1_key_parts = [];
+let room1_key_glow = null;
+let room1_lock_parts = [];
+let room1_lock_label = null;
+let room1_door_frame = null;
+let room1_prompt_text = null;
+let room1_prompt_bg = null;
+
+// ---- groups that slide when solved: [obj, baseX, baseY] --
+let room1_painting_parts = [];
+let room1_bookshelf_parts = [];
+let room1_drawer1 = null; // desk drawer that slides open on solve
+
+// ---- one-shot reveal animation start markers (loop_count, or -1) --
+let painting_move_start = -1;
+let bookshelf_move_start = -1;
+let drawer_open_start = -1;
+let chest_open_start = -1;
+let key_spawn_start = -1;
+let switch_toggle_start = -1;
+
+const REVEAL_ANIM_FRAMES = math_round(0.6 * FPS);
+
+function ease_out(p) {
+    return math_sin(p * math_PI / 2);
+}
+
+function anim_progress(start_frame, loop_count) {
+    if (start_frame < 0) {
+        return 0;
+    }
+    const elapsed = loop_count - start_frame;
+    if (elapsed <= 0) {
+        return 0;
+    }
+    if (elapsed >= REVEAL_ANIM_FRAMES) {
+        return 1;
+    }
+    return ease_out(elapsed / REVEAL_ANIM_FRAMES);
+}
+
+// ---- room shake (used by the wall-switch mechanism) ---------------
+let room_shake_until = -1;
+const ROOM_SHAKE_FRAMES = math_round(0.4 * FPS);
+
+function trigger_room_shake(loop_count) {
+    room_shake_until = loop_count + ROOM_SHAKE_FRAMES;
+    return undefined;
+}
+
+function current_room_shake_offset(loop_count) {
+    if (loop_count >= room_shake_until) {
+        return [0, 0];
+    }
+    const remaining = room_shake_until - loop_count;
+    const power = remaining / ROOM_SHAKE_FRAMES;
+    return [6 * power * math_sin(loop_count * 3.3), 4 * power * math_sin(loop_count * 2.1)];
+}
+
+// ---- sounds (only use URLs that actually load in Source Academy) -
+const mechanism_sound = create_audio("https://labs.phaser.io/assets/audio/SoundEffects/key.wav", 0.7);
+const chest_sound = create_audio("https://labs.phaser.io/assets/audio/SoundEffects/key.wav", 0.7);
+
+// ---- interact key edge trigger ------------------------------------
+let interact_prev = false;
+
+function interact_pressed_this_frame() {
+    const down = input_key_down("e");
+    const pressed = down && !interact_prev;
+    interact_prev = down;
+    return pressed;
+}
+
+// ================================================================
+//  REUSABLE PUZZLE POPUP FRAMEWORK
+//  (built from the same "pre-made objects, alpha toggled" trick as
+//  the dialogue system, since arcade_2d has no update_text/create-
+//  on-demand. Every later room can reuse start_puzzle/draw_puzzle/
+//  check_answer/give_reward. The typed-answer input display is a
+//  pre-made pool of per-slot/per-letter text objects - see
+//  "typed-answer input state" below - so nothing is ever created
+//  once the game loop has started.)
+//
+//  UI polish: popup is now bigger (680x420 instead of 520x300) with
+//  larger fonts/spacing, and themed like an old detective notebook -
+//  deep parchment/navy panel, gold/bronze border, dark-wood buttons
+//  that glow gold on hover, green pulse on success, red flash on fail.
+// ================================================================
+let active_puzzle = "";      // "" | "desk" | "painting" | "bookshelf" | "safe"
+let puzzle_sequence = [];    // digits/tile-indices entered so far
+let puzzle_feedback = "";    // "" | "success" | "fail"
+let puzzle_feedback_timer = 0;
+const PUZZLE_FEEDBACK_FRAMES = math_round(1 * FPS);
+
+// shared popup chrome
+let puzzle_backdrop = null;
+let puzzle_border_outer = null;
+let puzzle_box = null;
+let puzzle_msg_success = null;
+let puzzle_msg_fail = null;
+
+// per-puzzle title/instruction text: [name, title_obj, instruction_obj]
+let puzzle_headers = [];
+
+// DESK puzzle: a short detective riddle whose answer is a 4-letter
+// word. Tiles are scrambled letters of the answer; pressing them in
+// the right order (or typing the word) spells it out. See the
+// riddle text itself in puzzle_headers ("desk") below.
+//   "I am opened when curiosity strikes,
+//    and closed once the truth is found.
+//    Every detective keeps one open at all times,
+//    though I make no sound."
+//   Answer: CASE (as in "a case to solve")
+const DESK_TILE_LABELS = ["S", "C", "E", "A"];
+const DESK_CORRECT = [1, 3, 0, 2]; // press tiles spelling C, A, S, E
+let desk_tiles = []; // [obj, r, g, b] x4
+let desk_number_labels = [];
+
+// PAINTING puzzle: a simple A=1, B=2, C=3... substitution cipher.
+// The popup shows the numbers 13-15-15-14; the player converts each
+// number back to its letter (13th letter = M, 15th = O, 15th = O,
+// 14th = N) to get MOON, then picks it from the 3 options or types
+// it. This is a different skill from the desk riddle - decoding a
+// code rather than interpreting wordplay.
+const PAINTING_OPTIONS = ["MOON", "NOON", "SOON"];
+const PAINTING_CORRECT = 0; // MOON
+let painting_options = []; // [obj, r, g, b] x3
+let painting_number_labels = [];
+
+// BOOKSHELF puzzle: press the books in the right order. Instead of an
+// arbitrary permutation, the order follows real investigative logic:
+// a case is built reason -> proof -> culprit -> ruling. The clue text
+// (see puzzle_headers "bookshelf" below) states it as synonyms, not
+// as the literal book titles, so the player has to map "the reason"
+// to MOTIVE, "the proof" to EVIDENCE, "the culprit" to SUSPECT, and
+// "the ruling" to VERDICT before they can press anything.
+const BOOKSHELF_TILE_LABELS = ["SUSPECT", "MOTIVE", "EVIDENCE", "VERDICT"];
+const BOOKSHELF_CORRECT = [1, 2, 0, 3]; // press MOTIVE, EVIDENCE, SUSPECT, VERDICT
+let bookshelf_tiles = []; // [obj, r, g, b] x4
+let bookshelf_number_labels = [];
+
+// SAFE (treasure chest lock) puzzle: 3-digit code, shown only as
+// progress dots (not the literal digits) so the popup doesn't just
+// hand back the answer. The code is fully derivable from things the
+// player has directly experienced by this point in the room:
+//   1 - candles lit in this room (just the one on the desk)
+//   3 - puzzles already solved to get here (desk, painting, bookshelf)
+//   4 - letters in the painting's password, MOON
+// The order is spelled out in the clue text itself (see
+// puzzle_headers "safe" below), so nothing is left to guesswork.
+const SAFE_CORRECT = [1, 3, 4];
+let safe_dots = []; // [obj, r, g, b] x3
+
+// -- detective-notebook theme palette --
+const TILE_DEFAULT = [237, 224, 191];      // parchment
+const TILE_SELECTED = [110, 200, 120];     // correct-feeling green
+const TILE_HOVER = [230, 195, 110];        // golden hover
+const DOT_EMPTY = [70, 55, 40];
+const DOT_FILLED = [230, 180, 70];
+const PANEL_BG = [26, 22, 40];             // dark purple/navy panel
+const PANEL_BORDER = [196, 154, 74];       // gold/bronze border
+const BUTTON_WOOD = [58, 38, 24];          // dark wood
+const BUTTON_WOOD_HOVER = [214, 168, 78];  // golden glow hover
+
+function set_color(entry, a) {
+    update_color(entry[0], [entry[1], entry[2], entry[3], a]);
+}
+
+// -- typed-answer input state (for the DESK / PAINTING word puzzles) --
+// Stored as an array of single-letter strings (not a raw string),
+// since that lets us reuse array_length()/remove_last() instead of
+// needing string-slicing helpers that this language doesn't expose.
+let puzzle_typed_letters = [];
+let puzzle_input_box = null;
+let puzzle_input_label = null;
+
+let letter_prev = [];
+for (let li = 0; li < 26; li = li + 1) {
+    letter_prev[li] = false;
+}
+const LETTER_KEYS = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z"];
+const UPPER_LETTERS = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"];
+
+let backspace_prev = false;
+let puzzle_enter_prev = false;
+
+const DESK_ANSWER_LETTERS = ["C", "A", "S", "E"];
+const PAINTING_ANSWER_LETTERS = ["M", "O", "O", "N"];
+
+// shared Submit / Cancel buttons for every puzzle popup
+let puzzle_submit_box = null;
+let puzzle_submit_text = null;
+let puzzle_cancel_box = null;
+let puzzle_cancel_text = null;
+
+// ----------------------------------------------------------------
+//  Pre-made pool of typed-answer letter objects. arcade_2d cannot
+//  create gameobjects once update_loop is running (there is no
+//  create-on-demand for text), so instead of calling create_text()
+//  every keystroke, every possible (slot, letter) combination is
+//  created once up front and only repositioned/alpha-toggled at
+//  runtime - exactly like the tile/option/dot pools above.
+// ----------------------------------------------------------------
+const TYPED_MAX = 10;          // matches the cap in handle_puzzle_keyboard
+const INPUT_CHAR_SPACING = 34; // px between letters at the input's scale
+let puzzle_letter_objs = [];   // puzzle_letter_objs[slot][letterIndex] = obj
+let puzzle_underscore_obj = null; // shown when nothing has been typed yet
+
+function letter_index_of(letter) {
+    for (let li = 0; li < 26; li = li + 1) {
+        if (UPPER_LETTERS[li] === letter) {
+            return li;
+        }
+    }
+    return 0;
+}
+
+function draw_input_box(list, cx, cy) {
+    puzzle_input_label = make_text(list, cx, cy + 70, "Your Answer:", 0.75, 225, 210, 235, 0);
+    puzzle_input_box = make_rect(list, cx, cy + 108, 420, 56, 245, 232, 205, 0);
+    return undefined;
+}
+
+// Creates every letter object the typed-answer display could ever
+// need, all pre-made and invisible (alpha 0) until toggled on.
+function draw_puzzle_input_letters(list, cx, cy) {
+    const y = cy + 108;
+    puzzle_underscore_obj = make_text(list, cx, y, "_", 0.9, 40, 35, 30, 0);
+    for (let slot = 0; slot < TYPED_MAX; slot = slot + 1) {
+        const row = [];
+        for (let li = 0; li < 26; li = li + 1) {
+            row[li] = make_text(list, cx, y, UPPER_LETTERS[li], 0.9, 40, 35, 30, 0);
+        }
+        puzzle_letter_objs[slot] = row;
+    }
+    return undefined;
+}
+
+function draw_puzzle_ui(list) {
+    const cx = SCREEN_WIDTH / 2;
+    const cy = SCREEN_HEIGHT / 2;
+
+    puzzle_backdrop = make_rect(list, cx, cy, SCREEN_WIDTH, SCREEN_HEIGHT, 4, 3, 6, 0);
+    // gold/bronze outer border, drawn slightly larger than the panel
+    // itself so it reads as a frame rather than a second box.
+    puzzle_border_outer = make_rect(list, cx, cy, 700, 440, PANEL_BORDER[0], PANEL_BORDER[1], PANEL_BORDER[2], 0);
+    puzzle_box = make_rect(list, cx, cy, 680, 420, PANEL_BG[0], PANEL_BG[1], PANEL_BG[2], 0);
+    make_rect(list, cx, cy - 178, 620, 5, PANEL_BORDER[0], PANEL_BORDER[1], PANEL_BORDER[2], 0); // header underline
+
+    puzzle_msg_success = make_text(list, cx, cy + 155, "Correct!", 1.0, 110, 220, 120, 0);
+    puzzle_msg_fail = make_text(list, cx, cy + 155, "Incorrect. Try again.", 0.85, 230, 90, 80, 0);
+
+    draw_input_box(list, cx, cy);
+    draw_puzzle_input_letters(list, cx, cy);
+
+    puzzle_submit_box = make_rect(list, cx - 115, cy + 195, 190, 58, BUTTON_WOOD[0], BUTTON_WOOD[1], BUTTON_WOOD[2], 0);
+    puzzle_submit_text = make_text(list, cx - 115, cy + 195, "SUBMIT", 0.8, 235, 220, 190, 0);
+    puzzle_cancel_box = make_rect(list, cx + 115, cy + 195, 190, 58, BUTTON_WOOD[0], BUTTON_WOOD[1], BUTTON_WOOD[2], 0);
+    puzzle_cancel_text = make_text(list, cx + 115, cy + 195, "CANCEL", 0.8, 235, 220, 190, 0);
+
+    // -- DESK header + tiles --
+    const desk_title = make_text(list, cx, cy - 155, "THE DESK - A RIDDLE GUARDS THE DRAWER", 0.85, 230, 190, 90, 0);
+    const desk_instr = make_text(list, cx, cy - 110, "\"Opened when curiosity strikes, closed when truth is found. Every detective keeps one open at all times.\" Type the word, or press 1-4 for the scrambled letters.", 0.52, 210, 200, 220, 0);
+    puzzle_headers[array_length(puzzle_headers)] = ["desk", desk_title, desk_instr];
+
+    for (let i = 0; i < 4; i = i + 1) {
+        const tx = cx - 210 + i * 140;
+        const tile = make_text(list, tx, cy - 20, DESK_TILE_LABELS[i], 2.2, TILE_DEFAULT[0], TILE_DEFAULT[1], TILE_DEFAULT[2], 0);
+        desk_tiles[i] = [tile, TILE_DEFAULT[0], TILE_DEFAULT[1], TILE_DEFAULT[2]];
+        const num = make_text(list, tx, cy + 45, stringify(i + 1), 0.7, 190, 175, 210, 0);
+        desk_number_labels[i] = [num, 190, 175, 210];
+    }
+
+    // -- PAINTING header + options --
+    const painting_title = make_text(list, cx, cy - 155, "THE PAINTING - DECODE THE CIPHER", 0.85, 230, 190, 90, 0);
+    const painting_instr = make_text(list, cx, cy - 110, "Scratched into the frame: A=1, B=2, C=3 ... Decode: 13 - 15 - 15 - 14 - then pick the word it spells (1-3), click, or type it.", 0.52, 210, 200, 220, 0);
+    puzzle_headers[array_length(puzzle_headers)] = ["painting", painting_title, painting_instr];
+
+    for (let i = 0; i < 3; i = i + 1) {
+        const ox = cx - 210 + i * 210;
+        const opt = make_text(list, ox, cy - 20, PAINTING_OPTIONS[i], 1.15, TILE_DEFAULT[0], TILE_DEFAULT[1], TILE_DEFAULT[2], 0);
+        painting_options[i] = [opt, TILE_DEFAULT[0], TILE_DEFAULT[1], TILE_DEFAULT[2]];
+        const num = make_text(list, ox, cy + 45, stringify(i + 1), 0.7, 190, 175, 210, 0);
+        painting_number_labels[i] = [num, 190, 175, 210];
+    }
+
+    // -- BOOKSHELF header + tiles --
+    const bookshelf_title = make_text(list, cx, cy - 155, "THE BOOKSHELF - ORDER OF INVESTIGATION", 0.85, 230, 190, 90, 0);
+    const bookshelf_instr = make_text(list, cx, cy - 110, "A case is built in a fixed order: the reason, then the proof, then the culprit, then the ruling. Press the matching books in that order.", 0.52, 210, 200, 220, 0);
+    puzzle_headers[array_length(puzzle_headers)] = ["bookshelf", bookshelf_title, bookshelf_instr];
+
+    for (let i = 0; i < 4; i = i + 1) {
+        const tx = cx - 210 + i * 140;
+        const tile = make_text(list, tx, cy - 20, BOOKSHELF_TILE_LABELS[i], 0.72, TILE_DEFAULT[0], TILE_DEFAULT[1], TILE_DEFAULT[2], 0);
+        bookshelf_tiles[i] = [tile, TILE_DEFAULT[0], TILE_DEFAULT[1], TILE_DEFAULT[2]];
+        const num = make_text(list, tx, cy + 45, stringify(i + 1), 0.7, 190, 175, 210, 0);
+        bookshelf_number_labels[i] = [num, 190, 175, 210];
+    }
+
+    // -- CHEST LOCK header + progress dots --
+    const safe_title = make_text(list, cx, cy - 155, "THE TREASURE CHEST - A CODE EARNED, NOT GIVEN", 0.85, 230, 190, 90, 0);
+    const safe_instr = make_text(list, cx, cy - 110, "A tarnished plate reads: 'Candles lit in this room. Puzzles you have solved to reach me. Letters in the painting's password.' Enter the three numbers in that order.", 0.5, 210, 200, 220, 0);
+    puzzle_headers[array_length(puzzle_headers)] = ["safe", safe_title, safe_instr];
+
+    for (let i = 0; i < 3; i = i + 1) {
+        const dx = cx - 80 + i * 80;
+        const dot = make_circle(list, dx, cy - 20, 19, DOT_EMPTY[0], DOT_EMPTY[1], DOT_EMPTY[2], 0);
+        safe_dots[i] = [dot, DOT_EMPTY[0], DOT_EMPTY[1], DOT_EMPTY[2]];
+    }
+
+    return undefined;
+}
+
+function hide_typed_input_display() {
+    update_color(puzzle_underscore_obj, [40, 35, 30, 0]);
+    for (let slot = 0; slot < TYPED_MAX; slot = slot + 1) {
+        for (let li = 0; li < 26; li = li + 1) {
+            update_color(puzzle_letter_objs[slot][li], [40, 35, 30, 0]);
+        }
+    }
+    return undefined;
+}
+
+function hide_all_puzzle_ui() {
+    set_color([puzzle_backdrop, 4, 3, 6], 0);
+    set_color([puzzle_border_outer, PANEL_BORDER[0], PANEL_BORDER[1], PANEL_BORDER[2]], 0);
+    set_color([puzzle_box, PANEL_BG[0], PANEL_BG[1], PANEL_BG[2]], 0);
+    set_color([puzzle_msg_success, 110, 220, 120], 0);
+    set_color([puzzle_msg_fail, 230, 90, 80], 0);
+    set_color([puzzle_input_label, 225, 210, 235], 0);
+    set_color([puzzle_input_box, 245, 232, 205], 0);
+    set_color([puzzle_submit_box, BUTTON_WOOD[0], BUTTON_WOOD[1], BUTTON_WOOD[2]], 0);
+    set_color([puzzle_submit_text, 235, 220, 190], 0);
+    set_color([puzzle_cancel_box, BUTTON_WOOD[0], BUTTON_WOOD[1], BUTTON_WOOD[2]], 0);
+    set_color([puzzle_cancel_text, 235, 220, 190], 0);
+
+    hide_typed_input_display();
+
+    for (let i = 0; i < array_length(puzzle_headers); i = i + 1) {
+        const h = puzzle_headers[i];
+        set_color([h[1], 230, 190, 90], 0);
+        set_color([h[2], 210, 200, 220], 0);
+    }
+    for (let i = 0; i < 4; i = i + 1) {
+        set_color(desk_tiles[i], 0);
+        set_color(desk_number_labels[i], 0);
+        set_color(bookshelf_tiles[i], 0);
+        set_color(bookshelf_number_labels[i], 0);
+    }
+    for (let i = 0; i < 3; i = i + 1) {
+        set_color(painting_options[i], 0);
+        set_color(painting_number_labels[i], 0);
+        set_color(safe_dots[i], 0);
+    }
+    return undefined;
+}
+
+function show_puzzle_group(name) {
+    set_color([puzzle_backdrop, 4, 3, 6], 195);
+    set_color([puzzle_border_outer, PANEL_BORDER[0], PANEL_BORDER[1], PANEL_BORDER[2]], 255);
+    set_color([puzzle_box, PANEL_BG[0], PANEL_BG[1], PANEL_BG[2]], 255);
+    set_color([puzzle_input_label, 225, 210, 235], 255);
+    set_color([puzzle_input_box, 245, 232, 205], 255);
+    set_color([puzzle_submit_box, BUTTON_WOOD[0], BUTTON_WOOD[1], BUTTON_WOOD[2]], 255);
+    set_color([puzzle_submit_text, 235, 220, 190], 255);
+    set_color([puzzle_cancel_box, BUTTON_WOOD[0], BUTTON_WOOD[1], BUTTON_WOOD[2]], 255);
+    set_color([puzzle_cancel_text, 235, 220, 190], 255);
+
+    for (let i = 0; i < array_length(puzzle_headers); i = i + 1) {
+        const h = puzzle_headers[i];
+        const on = h[0] === name;
+        set_color([h[1], 230, 190, 90], on ? 255 : 0);
+        set_color([h[2], 210, 200, 220], on ? 255 : 0);
+    }
+
+    if (name === "desk") {
+        for (let i = 0; i < 4; i = i + 1) {
+            desk_tiles[i][1] = TILE_DEFAULT[0]; desk_tiles[i][2] = TILE_DEFAULT[1]; desk_tiles[i][3] = TILE_DEFAULT[2];
+            set_color(desk_tiles[i], 255);
+            set_color(desk_number_labels[i], 255);
+        }
+    } else if (name === "painting") {
+        for (let i = 0; i < 3; i = i + 1) {
+            painting_options[i][1] = TILE_DEFAULT[0]; painting_options[i][2] = TILE_DEFAULT[1]; painting_options[i][3] = TILE_DEFAULT[2];
+            set_color(painting_options[i], 255);
+            set_color(painting_number_labels[i], 255);
+        }
+    } else if (name === "bookshelf") {
+        for (let i = 0; i < 4; i = i + 1) {
+            bookshelf_tiles[i][1] = TILE_DEFAULT[0]; bookshelf_tiles[i][2] = TILE_DEFAULT[1]; bookshelf_tiles[i][3] = TILE_DEFAULT[2];
+            set_color(bookshelf_tiles[i], 255);
+            set_color(bookshelf_number_labels[i], 255);
+        }
+    } else if (name === "safe") {
+        for (let i = 0; i < 3; i = i + 1) {
+            safe_dots[i][1] = DOT_EMPTY[0]; safe_dots[i][2] = DOT_EMPTY[1]; safe_dots[i][3] = DOT_EMPTY[2];
+            set_color(safe_dots[i], 255);
+        }
+    }
+    return undefined;
+}
+
+// ----------------------------------------------------------------
+//  start_puzzle() - opens the popup for a named puzzle and resets
+//  its input state. Movement is implicitly disabled elsewhere by
+//  checking `active_puzzle === ""` before calling player-move code.
+// ----------------------------------------------------------------
+function start_puzzle(name) {
+    active_puzzle = name;
+    puzzle_sequence = [];
+    puzzle_typed_letters = [];
+    puzzle_feedback = "";
+    puzzle_feedback_timer = 0;
+    show_puzzle_group(name);
+    update_puzzle_input();
+    return undefined;
+}
+
+function close_puzzle() {
+    active_puzzle = "";
+    puzzle_sequence = [];
+    puzzle_typed_letters = [];
+    puzzle_feedback = "";
+    hide_all_puzzle_ui();
+    return undefined;
+}
+
+function arrays_equal(a, b) {
+    if (array_length(a) !== array_length(b)) {
+        return false;
+    }
+    let equal = true;
+    for (let i = 0; i < array_length(a); i = i + 1) {
+        if (a[i] !== b[i]) {
+            equal = false;
+        }
+    }
+    return equal;
+}
+
+// Builds a new array missing the last element - used for Backspace,
+// since there is no built-in array "pop".
+function remove_last(arr) {
+    const result = [];
+    for (let i = 0; i < array_length(arr) - 1; i = i + 1) {
+        result[i] = arr[i];
+    }
+    return result;
+}
+
+// Joins an array of single-character strings into one string, so
+// the typed answer can be shown as one piece of text.
+function letters_to_string(arr) {
+    let s = "";
+    for (let i = 0; i < array_length(arr); i = i + 1) {
+        s = s + arr[i];
+    }
+    return s;
+}
+
+// ----------------------------------------------------------------
+//  update_puzzle_input() - re-renders the typed-answer display by
+//  repositioning/alpha-toggling the pre-made letter pool. No
+//  gameobjects are created here (see draw_puzzle_input_letters()),
+//  which is what makes it safe to call from inside update_loop.
+// ----------------------------------------------------------------
+function update_puzzle_input() {
+    hide_typed_input_display();
+
+    const n = array_length(puzzle_typed_letters);
+    const cx = SCREEN_WIDTH / 2;
+    const cy = SCREEN_HEIGHT / 2;
+    const y = cy + 108;
+
+    if (n === 0) {
+        update_position(puzzle_underscore_obj, [cx, y]);
+        update_color(puzzle_underscore_obj, [40, 35, 30, 255]);
+        return undefined;
+    }
+
+    const start_x = cx - (n - 1) * INPUT_CHAR_SPACING / 2;
+    for (let i = 0; i < n; i = i + 1) {
+        const li = letter_index_of(puzzle_typed_letters[i]);
+        const obj = puzzle_letter_objs[i][li];
+        update_position(obj, [start_x + i * INPUT_CHAR_SPACING, y]);
+        update_color(obj, [40, 35, 30, 255]);
+    }
+    return undefined;
+}
+
+// ----------------------------------------------------------------
+//  Shared tile/option "select" helpers - called identically by
+//  number-key presses and by mouse clicks, so both input methods
+//  stay perfectly in sync.
+// ----------------------------------------------------------------
+function select_desk_tile(tile_index) {
+    puzzle_sequence[array_length(puzzle_sequence)] = tile_index;
+    desk_tiles[tile_index][1] = TILE_SELECTED[0];
+    desk_tiles[tile_index][2] = TILE_SELECTED[1];
+    desk_tiles[tile_index][3] = TILE_SELECTED[2];
+    set_color(desk_tiles[tile_index], 255);
+    return undefined;
+}
+
+function select_painting_option(opt_index) {
+    puzzle_sequence = [opt_index];
+    painting_options[opt_index][1] = TILE_SELECTED[0];
+    painting_options[opt_index][2] = TILE_SELECTED[1];
+    painting_options[opt_index][3] = TILE_SELECTED[2];
+    set_color(painting_options[opt_index], 255);
+    return undefined;
+}
+
+function select_bookshelf_tile(tile_index) {
+    puzzle_sequence[array_length(puzzle_sequence)] = tile_index;
+    bookshelf_tiles[tile_index][1] = TILE_SELECTED[0];
+    bookshelf_tiles[tile_index][2] = TILE_SELECTED[1];
+    bookshelf_tiles[tile_index][3] = TILE_SELECTED[2];
+    set_color(bookshelf_tiles[tile_index], 255);
+    return undefined;
+}
+
+function select_safe_digit(digit) {
+    const dot_index = array_length(puzzle_sequence);
+    if (dot_index < 3) {
+        puzzle_sequence[dot_index] = digit;
+        safe_dots[dot_index][1] = DOT_FILLED[0];
+        safe_dots[dot_index][2] = DOT_FILLED[1];
+        safe_dots[dot_index][3] = DOT_FILLED[2];
+        set_color(safe_dots[dot_index], 255);
+    }
+    return undefined;
+}
+
+// Routes a pressed digit (0-9) to whichever puzzle is currently open.
+function apply_digit_input(digit) {
+    if (active_puzzle === "desk") {
+        if (digit >= 1 && digit <= 4) {
+            select_desk_tile(digit - 1);
+        }
+    } else if (active_puzzle === "painting") {
+        if (digit >= 1 && digit <= 3) {
+            select_painting_option(digit - 1);
+        }
+    } else if (active_puzzle === "bookshelf") {
+        if (digit >= 1 && digit <= 4) {
+            select_bookshelf_tile(digit - 1);
+        }
+    } else if (active_puzzle === "safe") {
+        select_safe_digit(digit);
+    }
+    return undefined;
+}
+
+// ----------------------------------------------------------------
+//  check_answer() - compares the current input against the correct
+//  answer for the active puzzle, and shows success/failure feedback.
+//  Word puzzles accept EITHER the original tile/option selection OR
+//  a fully typed-and-Enter-ed word.
+// ----------------------------------------------------------------
+function check_answer(name) {
+    let correct = false;
+
+    if (name === "desk") {
+        correct = arrays_equal(puzzle_sequence, DESK_CORRECT) || arrays_equal(puzzle_typed_letters, DESK_ANSWER_LETTERS);
+    } else if (name === "painting") {
+        correct = puzzle_sequence[0] === PAINTING_CORRECT || arrays_equal(puzzle_typed_letters, PAINTING_ANSWER_LETTERS);
+    } else if (name === "bookshelf") {
+        correct = arrays_equal(puzzle_sequence, BOOKSHELF_CORRECT);
+    } else if (name === "safe") {
+        correct = arrays_equal(puzzle_sequence, SAFE_CORRECT);
+    }
+
+    if (correct) {
+        puzzle_feedback = "success";
+        set_color([puzzle_msg_success, 110, 220, 120], 255);
+        update_scale(puzzle_msg_success, [1.0, 1.0]);
+    } else {
+        puzzle_feedback = "fail";
+        set_color([puzzle_msg_fail, 230, 90, 80], 255);
+    }
+    puzzle_feedback_timer = PUZZLE_FEEDBACK_FRAMES;
+    return undefined;
+}
+
+// ----------------------------------------------------------------
+//  submit_puzzle() - the single entry point used by the Submit
+//  button, the Enter key, and (implicitly) nothing else: answers are
+//  ONLY checked when the player explicitly submits.
+// ----------------------------------------------------------------
+function submit_puzzle() {
+    if (active_puzzle === "" || puzzle_feedback_timer > 0) {
+        return undefined;
+    }
+    check_answer(active_puzzle);
+    return undefined;
+}
+
+// ----------------------------------------------------------------
+//  give_reward() - applies the room-state change + reveal animation
+//  earned by solving a given puzzle, and unlocks the next object.
+// ----------------------------------------------------------------
+function give_reward(name, loop_count) {
+    if (name === "desk") {
+        room1_state[ST_DESK] = true;
+        drawer_open_start = loop_count;
+        unlock_next_object("painting");
+    } else if (name === "painting") {
+        reveal_switch(loop_count);
+    } else if (name === "bookshelf") {
+        slide_bookshelf(loop_count);
+    } else if (name === "safe") {
+        open_treasure(loop_count);
+    }
+    return undefined;
+}
+
+// Semantic hook: each puzzle's reveal already flips the room_state
+// flag that the *next* interactable's visible_fn() checks, so there
+// is nothing else to flip here - this just documents the gating and
+// gives future rooms a single place to add extra unlock logic.
+function unlock_next_object(name) {
+    if (name === "painting") {
+        // painting interactable already becomes meaningfully useful
+        // once ST_DESK is true (see search_object's gating below)
+    } else if (name === "switch") {
+        // switch interactable becomes visible once ST_PAINTING is true
+    } else if (name === "safe") {
+        // chest interactable becomes visible once ST_BOOKSHELF is true
+    }
+    return undefined;
+}
+
+// ----------------------------------------------------------------
+//  reveal_switch() - painting puzzle solved: slides the painting
+//  aside and reveals the hidden wall switch behind it.
+// ----------------------------------------------------------------
+function reveal_switch(loop_count) {
+    room1_state[ST_PAINTING] = true;
+    painting_move_start = loop_count;
+    draw_dialogue("painting_solved");
+    unlock_next_object("switch");
+    return undefined;
+}
+
+// ----------------------------------------------------------------
+//  toggle_switch() - flips the wall switch: plays a mechanical
+//  sound, shakes the room, animates the lever, and activates the
+//  hidden mechanism that unlocks the bookshelf.
+// ----------------------------------------------------------------
+function toggle_switch(loop_count) {
+    room1_state[ST_SWITCH] = true;
+    switch_toggle_start = loop_count;
+    play_audio(mechanism_sound);
+    trigger_room_shake(loop_count);
+    draw_dialogue("switch_flip");
+    return undefined;
+}
+
+// ----------------------------------------------------------------
+//  slide_bookshelf() - bookshelf puzzle solved: slides the shelf
+//  aside, revealing the hidden compartment with the treasure chest.
+// ----------------------------------------------------------------
+function slide_bookshelf(loop_count) {
+    room1_state[ST_BOOKSHELF] = true;
+    bookshelf_move_start = loop_count;
+    draw_dialogue("bookshelf_solved");
+    spawn_treasure_chest();
+    return undefined;
+}
+
+// ----------------------------------------------------------------
+//  spawn_treasure_chest() - the chest itself is always drawn (see
+//  draw_furniture()); this hook just documents the moment it
+//  becomes visible/interactable, which is already gated by
+//  chest_visible() once ST_BOOKSHELF flips.
+// ----------------------------------------------------------------
+function spawn_treasure_chest() {
+    // no extra state needed - chest_visible() covers this.
+    return undefined;
+}
+
+// ----------------------------------------------------------------
+//  open_treasure() - chest puzzle (lock) solved: plays the lock
+//  click line, opens the lid, and immediately follows with the
+//  key reward animation via spawn_room_key().
+// ----------------------------------------------------------------
+function open_treasure(loop_count) {
+    room1_state[ST_SAFE] = true;
+    chest_open_start = loop_count;
+    play_audio(chest_sound);
+    draw_dialogue("chest_unlocked");
+    // Spawn the key immediately after the chest opens
+    spawn_room_key(loop_count);
+    return undefined;
+}
+
+// ----------------------------------------------------------------
+//  spawn_room_key() - STEP 1: reveals the golden key with the
+//  glowing "ROOM KEY FOUND!" reward animation once the chest has
+//  been opened. Player movement is locked for the duration (see
+//  key_reward_active()). Visual details (glow, sparkles, rise,
+//  banner, screen flash) are computed every frame by
+//  play_key_animation() using key_spawn_start as the animation's
+//  t=0 reference.
+// ----------------------------------------------------------------
+function spawn_room_key(loop_count) {
+    key_spawn_start = loop_count;
+    room1_state[ST_CHEST_OPEN] = true;
+    return undefined;
+}
+
+const KEY_REWARD_FRAMES = math_round(2.5 * FPS); // ~2.5s reward animation, matches "about 2 seconds" + a little settle time
+
+function key_reward_active(loop_count) {
+    return key_spawn_start >= 0 && loop_count < key_spawn_start + KEY_REWARD_FRAMES;
+}
+
+// ----------------------------------------------------------------
+//  play_key_animation() - STEP 1 (continued): computes the reward-
+//  animation visuals for the current frame - golden glow pulse, key
+//  slowly rising, scale-up pop, sparkle ring, "ROOM KEY FOUND!"
+//  banner, and a brief screen flash (a lightweight stand-in for
+//  "camera shake" since arcade_2d has no camera API to shake -
+//  the whole room1_player + interactable set already gets a real
+//  positional shake elsewhere via current_room_shake_offset(), which
+//  is reused for the switch; a light flash reads clearly here
+//  instead without needing a camera). Called every frame from
+//  animate_room().
+// ----------------------------------------------------------------
+function play_key_animation(t, loop_count) {
+    if (key_spawn_start < 0) {
+        return undefined;
+    }
+
+    const elapsed = loop_count - key_spawn_start;
+    const p = math_min(1, math_max(0, elapsed / KEY_REWARD_FRAMES));
+
+    // rises upward and scales in during the first half, then settles
+    const rise = -18 * ease_out(math_min(1, p * 1.6));
+    const scale_pop = 1 + 0.6 * math_max(0, 1 - math_min(1, elapsed / (FPS * 0.5)));
+
+    for (let i = 0; i < array_length(room1_key_parts); i = i + 1) {
+        const part = room1_key_parts[i];
+        update_scale(part, [scale_pop, scale_pop]);
+    }
+    update_position(room1_key_glow, [175, 430 + rise]);
+
+    const glow_pulse = 1.3 + 0.5 * math_sin(t * 6);
+    const glow_alpha = key_reward_active(loop_count) ? 220 : (90 + 60 * math_sin(t * 2.5));
+    update_scale(room1_key_glow, [glow_pulse, glow_pulse]);
+    update_color(room1_key_glow, [255, 235, 140, glow_alpha]);
+
+    // brief screen flash right when the key appears (stand-in for a
+    // camera shake, since arcade_2d exposes no camera-shake API)
+    if (elapsed >= 0 && elapsed < math_round(0.25 * FPS)) {
+        const flash_p = 1 - elapsed / math_round(0.25 * FPS);
+        update_color(room1_fade_rect, [255, 240, 180, 160 * flash_p]);
+    } else if (elapsed >= math_round(0.25 * FPS) && elapsed < math_round(0.3 * FPS) && door_fade_state === "none") {
+        update_color(room1_fade_rect, [0, 0, 0, 0]);
+    }
+
+    // "ROOM KEY FOUND!" banner + sparkle/floating-particle ring,
+    // shown only while the reward window is active
+    if (key_reward_active(loop_count)) {
+        const banner_p = math_min(1, elapsed / (FPS * 0.3));
+        update_color(room1_key_banner, [255, 225, 120, 255 * banner_p]);
+        update_scale(room1_key_banner, [1 + 0.15 * math_sin(t * 8), 1 + 0.15 * math_sin(t * 8)]);
+
+        for (let i = 0; i < array_length(room1_key_sparkles); i = i + 1) {
+            const s = room1_key_sparkles[i];
+            const spark = s[0];
+            const angle = s[1] + t * 2;
+            const radius = 30 + 20 * p;
+            const sx = 175 + radius * math_cos(angle);
+            const sy = 430 + rise + radius * math_sin(angle);
+            update_position(spark, [sx, sy]);
+            update_color(spark, [255, 230, 140, 200 * (1 - p * 0.3)]);
+            update_scale(spark, [0.6 + 0.4 * math_sin(t * 5 + i), 0.6 + 0.4 * math_sin(t * 5 + i)]);
+        }
+    } else {
+        update_color(room1_key_banner, [255, 225, 120, 0]);
+        for (let i = 0; i < array_length(room1_key_sparkles); i = i + 1) {
+            update_color(room1_key_sparkles[i][0], [255, 230, 140, 0]);
+        }
+    }
+
+    return undefined;
+}
+
+// ----------------------------------------------------------------
+//  pickup_room_key() / collect_key() - STEP 2: the player picks up
+//  the key: removes it from view (key_visible() turns off once
+//  ST_KEY flips), adds "Room 1 Master Key" to the (session-only)
+//  inventory array, shows "You obtained the Room 1 Master Key.",
+//  and sets the requested player_has_room1_key boolean to true.
+//  collect_key() is the original name kept for compatibility with
+//  search_object(); pickup_room_key() is a thin alias matching the
+//  requested helper-function name.
+// ----------------------------------------------------------------
+let inventory = []; // simple array of item-name strings
+
+function collect_key() {
+    room1_state[ST_KEY] = true;
+    player_has_room1_key = true;
+    inventory[array_length(inventory)] = "Room 1 Master Key";
+    draw_dialogue("key_pickup");
+    // DO NOT call complete_room() here - that happens AFTER exiting
+    return undefined;
+}
+
+function pickup_room_key() {
+    return collect_key();
+}
+
+// ----------------------------------------------------------------
+//  unlock_exit_door() / unlock_exit() - STEP 3: flips the door
+//  state, refreshes its visuals (removes the lock icon, recolors
+//  the frame), and marks Room 1 as completed via complete_room1().
+//  unlock_exit() is the original name kept for compatibility with
+//  search_object(); unlock_exit_door() is a thin alias matching the
+//  requested helper-function name.
+// ----------------------------------------------------------------
+function unlock_exit() {
+    room1_state[ST_DOOR] = true;
+    sync_room1_visuals();
+    complete_room1(); // Room 1 is now completed
+    return undefined;
+}
+
+function unlock_exit_door() {
+    return unlock_exit();
+}
+
+// complete_room1() - thin alias over the existing complete_room(0)
+// hallway-sync helper, matching the requested helper-function name.
+// complete_room(0) already flips room_completed[0] = true AND calls
+// unlock_room2(), which is exactly STEP 5 ("Room 1 -> Completed",
+// "Room 2 -> Unlocked").
+function complete_room1() {
+    complete_room(0);
+    return undefined;
+}
+
+// ----------------------------------------------------------------
+//  handle_puzzle_keyboard() - routes ALL keyboard input to the
+//  active puzzle: letters build the typed answer, Backspace edits
+//  it, Enter submits, and number keys still drive the original
+//  tile/digit selection mechanism.
+// ----------------------------------------------------------------
+function handle_puzzle_keyboard() {
+    for (let li = 0; li < 26; li = li + 1) {
+        const down = input_key_down(LETTER_KEYS[li]);
+        const pressed = down && !letter_prev[li];
+        letter_prev[li] = down;
+        if (pressed && array_length(puzzle_typed_letters) < TYPED_MAX) {
+            puzzle_typed_letters[array_length(puzzle_typed_letters)] = UPPER_LETTERS[li];
+            update_puzzle_input();
+        }
+    }
+
+    const back_down = input_key_down("Backspace");
+    const back_pressed = back_down && !backspace_prev;
+    backspace_prev = back_down;
+    if (back_pressed && array_length(puzzle_typed_letters) > 0) {
+        puzzle_typed_letters = remove_last(puzzle_typed_letters);
+        update_puzzle_input();
+    }
+
+    const enter_down = input_key_down("Enter");
+    const enter_pressed = enter_down && !puzzle_enter_prev;
+    puzzle_enter_prev = enter_down;
+    if (enter_pressed) {
+        submit_puzzle();
+    }
+
+    const digit = pressed_digit_this_frame();
+    if (digit !== -1) {
+        apply_digit_input(digit);
+    }
+
+    return undefined;
+}
+
+// ----------------------------------------------------------------
+//  handle_puzzle_mouse() - hover highlighting + click-to-select for
+//  every tile/option, plus the shared Submit / Cancel buttons.
+// ----------------------------------------------------------------
+function handle_puzzle_mouse(clicked) {
+    if (active_puzzle === "desk") {
+        for (let i = 0; i < 4; i = i + 1) {
+            const obj = desk_tiles[i][0];
+            if (pointer_over_gameobject(obj)) {
+                update_color(obj, [TILE_HOVER[0], TILE_HOVER[1], TILE_HOVER[2], 255]);
+                if (clicked) { select_desk_tile(i); }
+            } else {
+                set_color(desk_tiles[i], 255);
+            }
+        }
+    } else if (active_puzzle === "painting") {
+        for (let i = 0; i < 3; i = i + 1) {
+            const obj = painting_options[i][0];
+            if (pointer_over_gameobject(obj)) {
+                update_color(obj, [TILE_HOVER[0], TILE_HOVER[1], TILE_HOVER[2], 255]);
+                if (clicked) { select_painting_option(i); }
+            } else {
+                set_color(painting_options[i], 255);
+            }
+        }
+    } else if (active_puzzle === "bookshelf") {
+        for (let i = 0; i < 4; i = i + 1) {
+            const obj = bookshelf_tiles[i][0];
+            if (pointer_over_gameobject(obj)) {
+                update_color(obj, [TILE_HOVER[0], TILE_HOVER[1], TILE_HOVER[2], 255]);
+                if (clicked) { select_bookshelf_tile(i); }
+            } else {
+                set_color(bookshelf_tiles[i], 255);
+            }
+        }
+    }
+    // "safe" only accepts digit-key input (no clickable value picker)
+
+    const submit_hover = pointer_over_gameobject(puzzle_submit_box);
+    update_color(puzzle_submit_box, submit_hover
+        ? [BUTTON_WOOD_HOVER[0], BUTTON_WOOD_HOVER[1], BUTTON_WOOD_HOVER[2], 255]
+        : [BUTTON_WOOD[0], BUTTON_WOOD[1], BUTTON_WOOD[2], 255]);
+    if (submit_hover && clicked) {
+        submit_puzzle();
+    }
+
+    const cancel_hover = pointer_over_gameobject(puzzle_cancel_box);
+    update_color(puzzle_cancel_box, cancel_hover
+        ? [BUTTON_WOOD_HOVER[0], BUTTON_WOOD_HOVER[1], BUTTON_WOOD_HOVER[2], 255]
+        : [BUTTON_WOOD[0], BUTTON_WOOD[1], BUTTON_WOOD[2], 255]);
+    if (cancel_hover && clicked) {
+        close_puzzle();
+    }
+
+    return undefined;
+}
+
+// ----------------------------------------------------------------
+//  draw_puzzle() - called every frame while a puzzle is active.
+//  Disables room movement/interaction implicitly (the main loop
+//  only calls this OR the room-movement code, never both), drives
+//  the success/failure feedback timer, and otherwise delegates all
+//  input to handle_puzzle_keyboard()/handle_puzzle_mouse().
+// ----------------------------------------------------------------
+function draw_puzzle(loop_count, escaped, clicked) {
+    if (active_puzzle === "") {
+        return undefined;
+    }
+
+    if (escaped) {
+        close_puzzle();
+        return undefined;
+    }
+
+    if (puzzle_feedback_timer > 0) {
+        if (puzzle_feedback === "success") {
+            const progress = 1 - (puzzle_feedback_timer / PUZZLE_FEEDBACK_FRAMES);
+            const pulse = 1 + 0.35 * math_sin(progress * math_PI);
+            update_scale(puzzle_msg_success, [1.0 * pulse, 1.0 * pulse]);
+        }
+
+        puzzle_feedback_timer = puzzle_feedback_timer - 1;
+        if (puzzle_feedback_timer === 0) {
+            if (puzzle_feedback === "success") {
+                const solved_name = active_puzzle;
+                set_color([puzzle_msg_success, 110, 220, 120], 0);
+                close_puzzle();
+                give_reward(solved_name, loop_count);
+            } else {
+                set_color([puzzle_msg_fail, 230, 90, 80], 0);
+                puzzle_feedback = "";
+                puzzle_sequence = [];
+                puzzle_typed_letters = [];
+                update_puzzle_input();
+                show_puzzle_group(active_puzzle); // resets tile colors
+            }
+        }
+        return undefined; // ignore further input while feedback is showing
+    }
+
+    handle_puzzle_keyboard();
+    handle_puzzle_mouse(clicked);
+
+    return undefined;
+}
+
+// ----------------------------------------------------------------
+//  LAYOUT: walls + floor
+// ----------------------------------------------------------------
+function draw_room1_layout(list) {
+    // back wall (wallpaper)
+    make_rect(list, SCREEN_WIDTH / 2, 180, SCREEN_WIDTH, 360, 58, 46, 42, 255);
+    for (let row = 0; row < 3; row = row + 1) {
+        make_rect(list, SCREEN_WIDTH / 2, 60 + row * 100, SCREEN_WIDTH, 2, 45, 35, 32, 150);
+    }
+
+    // wooden floor
+    make_rect(list, SCREEN_WIDTH / 2, 480, SCREEN_WIDTH, 240, 92, 60, 33, 255);
+    for (let plank = 0; plank < 9; plank = plank + 1) {
+        make_rect(list, 20 + plank * 90, 480, 4, 240, 62, 40, 20, 255);
+    }
+
+    // baseboard trim between wall and floor
+    make_rect(list, SCREEN_WIDTH / 2, 360, SCREEN_WIDTH, 10, 35, 28, 22, 255);
+
+    return undefined;
+}
+
+// ----------------------------------------------------------------
+//  FURNITURE: desk+drawer, bookshelf, painting, window+curtain,
+//  exit door, carpet, and the hidden treasure chest.
+// ----------------------------------------------------------------
+function draw_furniture(list) {
+    const painting_parts = [];
+    const bookshelf_parts = [];
+
+    const track = (arr, obj, x, y) => {
+        arr[array_length(arr)] = [obj, x, y];
+        return obj;
+    };
+
+    // -- desk with one visible drawer that slides open on solve --
+    make_rect(list, 190, 440, 150, 70, 74, 48, 26, 255);
+    make_rect(list, 190, 415, 150, 10, 95, 63, 35, 255);
+    make_rect(list, 130, 468, 10, 55, 60, 38, 20, 255);
+    make_rect(list, 250, 468, 10, 55, 60, 38, 20, 255);
+    room1_drawer1 = make_rect(list, 190, 462, 110, 18, 55, 36, 20, 255);
+    make_circle(list, 190, 462, 3, 20, 15, 10, 255);
+    room1_blocking_rects[array_length(room1_blocking_rects)] = [190, 445, 150, 90, "furniture"];
+
+    // -- bookshelf (tracked so it can slide sideways) --
+    track(bookshelf_parts, make_rect(list, 110, 420, 95, 190, 55, 36, 20, 255), 110, 420);
+    for (let shelf = 0; shelf < 4; shelf = shelf + 1) {
+        track(bookshelf_parts, make_rect(list, 110, 350 + shelf * 45, 88, 6, 35, 22, 12, 255), 110, 350 + shelf * 45);
+    }
+    for (let book = 0; book < 8; book = book + 1) {
+        const bx = 75 + book * 11;
+        const shelf_row = book % 4;
+        const by = 335 + shelf_row * 45;
+        const br = 70 + math_random() * 90;
+        const bg = 30 + math_random() * 50;
+        const bb = 20 + math_random() * 35;
+        track(bookshelf_parts, make_rect(list, bx, by, 9, 34, br, bg, bb, 255), bx, by);
+    }
+    room1_blocking_rects[array_length(room1_blocking_rects)] = [110, 420, 95, 190, "furniture"];
+
+    // -- hidden treasure chest, revealed once the bookshelf slides away.
+    //    Body + lid (lid tracked separately so it can swing open), plus
+    //    a small padlock that disappears once the chest is unlocked.
+    const chest_body = make_rect(list, 175, 445, 74, 55, 74, 48, 26, 0);
+    const chest_band = make_rect(list, 175, 445, 74, 8, 200, 170, 70, 0);
+    room1_chest_lid = make_rect(list, 175, 415, 78, 26, 90, 60, 33, 0);
+    const chest_lock = make_circle(list, 175, 420, 8, 200, 170, 70, 0);
+    room1_chest_parts = [chest_body, chest_band, room1_chest_lid, chest_lock];
+
+    // -- painting frame + canvas (tracked so it can slide aside) --
+    track(painting_parts, make_rect(list, 430, 195, 130, 100, 40, 30, 18, 255), 430, 195);
+    track(painting_parts, make_rect(list, 430, 195, 110, 82, 70, 55, 40, 255), 430, 195);
+    track(painting_parts, make_triangle(list, 430, 220, 40, 30, 45, 55, 40, 255), 430, 220);
+    track(painting_parts, make_circle(list, 460, 175, 12, 220, 190, 90, 255), 460, 175);
+
+    // -- window --
+    make_rect(list, 620, 190, 130, 150, 40, 32, 24, 255);
+    const window_glass = make_rect(list, 620, 190, 106, 126, 40, 55, 85, 200);
+    make_rect(list, 620, 190, 6, 126, 40, 32, 24, 255);
+    make_rect(list, 620, 190, 106, 6, 40, 32, 24, 255);
+    const curtain = make_rect(list, 565, 195, 34, 160, 90, 30, 35, 230);
+    update_position(curtain, [565, 195]);
+
+    // -- exit door (locked look reused from the hallway's draw_lock) --
+    const door_x = 735;
+    const door_y = 460;
+    room1_door_frame = make_rect(list, door_x, door_y, 130, 220, 40, 36, 40, 255);
+    make_rect(list, door_x, door_y, 105, 200, 66, 42, 24, 255);
+    make_rect(list, door_x, door_y - 45, 78, 58, 58, 36, 18, 255);
+    make_rect(list, door_x, door_y + 45, 78, 58, 58, 36, 18, 255);
+    make_circle(list, door_x - 32, door_y, 5, 18, 18, 20, 255);
+    room1_lock_parts = draw_lock(list, door_x, door_y);
+    room1_lock_label = make_text(list, door_x, door_y + 128, "LOCKED", 0.6, 220, 90, 80, 255);
+    room1_blocking_rects[array_length(room1_blocking_rects)] = [door_x, door_y, 130, 220, "door"];
+
+    // -- small carpet --
+    make_rect(list, 430, 520, 220, 110, 120, 40, 40, 255);
+    make_rect(list, 430, 520, 190, 80, 150, 60, 55, 255);
+    make_rect(list, 430, 520, 150, 50, 175, 85, 70, 255);
+
+    room1_painting_parts = painting_parts;
+    room1_bookshelf_parts = bookshelf_parts;
+
+    return [window_glass, curtain];
+}
+
+// ----------------------------------------------------------------
+//  OBJECTS: candle, dust, hidden switch/chest/key, interaction
+//  rings, dialogue box, interact prompt, player avatar
+// ----------------------------------------------------------------
+function make_interactable(list, name, x, y, range, ring_radius, visible_fn, prompt_label) {
+    const ring = make_circle(list, x, y, ring_radius, 255, 235, 150, 0);
+    room1_interactables[array_length(room1_interactables)] = [name, x, y, range, ring, visible_fn, prompt_label];
+    return ring;
+}
+
+let room1_key_banner = null;
+let room1_key_sparkles = [];
+
+function draw_objects(list) {
+    // candle on the desk (reuses the landing scene's candle helper)
+    const candle = draw_one_candle(list, 195, 405, 1.4);
+
+    // ambient dust
+    const dust = create_dust(list, 14, 200, 550);
+
+    // interactable zones - one per searchable object
+    // NOTE: "painting" now uses painting_visible() instead of
+    // always_visible() - see the FIX comment near painting_visible()
+    // above for why this matters for the switch to ever register.
+    make_interactable(list, "desk", 190, 445, 95, 55, always_visible, "Press E to Inspect");
+    make_interactable(list, "bookshelf", 110, 420, 120, 65, always_visible, "Press E to Inspect");
+    make_interactable(list, "painting", 430, 195, 150, 70, painting_visible, "Press E to Inspect");
+    make_interactable(list, "window", 620, 190, 150, 75, always_visible, "Press E to Inspect");
+    make_interactable(list, "curtain", 565, 195, 110, 40, always_visible, "Press E to Inspect");
+    make_interactable(list, "carpet", 430, 520, 120, 90, always_visible, "Press E to Inspect");
+    make_interactable(list, "door", 735, 460, 100, 70, always_visible, "Press E to Unlock Door");
+
+    // hidden switch (revealed once the painting puzzle is solved)
+    room1_switch_glow = make_circle(list, 430, 195, 18, 255, 240, 140, 0);
+    room1_switch_sprite = make_circle(list, 430, 195, 9, 60, 55, 50, 0);
+    room1_switch_lever = make_rect(list, 430, 190, 5, 16, 210, 175, 60, 0);
+    make_interactable(list, "switch", 430, 195, 90, 22, switch_visible, "Press E to Toggle Switch");
+
+    // hidden treasure chest (revealed once the bookshelf puzzle is solved)
+    make_interactable(list, "chest", 175, 430, 90, 24, chest_visible, "Press E to Open Chest");
+
+    // hidden key (revealed once the chest opens)
+    room1_key_glow = make_circle(list, 175, 430, 20, 255, 240, 150, 0);
+    const key_body = make_circle(list, 175, 430, 9, 230, 195, 90, 0);
+    const key_shaft = make_rect(list, 187, 430, 16, 4, 230, 195, 90, 0);
+    const key_tooth = make_rect(list, 194, 434, 4, 6, 230, 195, 90, 0);
+    room1_key_parts = [key_body, key_shaft, key_tooth];
+    make_interactable(list, "key", 175, 430, 90, 24, key_visible, "Press E to Pick Up Key");
+
+    // reward-animation banner + sparkle ring (used only by play_key_animation)
+    room1_key_banner = make_text(list, SCREEN_WIDTH / 2, 260, "ROOM KEY FOUND!", 1.3, 255, 225, 120, 0);
+    for (let i = 0; i < 10; i = i + 1) {
+        const spark = make_circle(list, 175, 430, 3, 255, 230, 140, 0);
+        room1_key_sparkles[i] = [spark, (i / 10) * math_PI * 2];
+    }
+
+    // player avatar
+    const body = make_circle(list, room1_player_x, room1_player_y, PLAYER_RADIUS, 35, 35, 48, 255);
+    const head = make_circle(list, room1_player_x, room1_player_y - 18, 9, 210, 180, 150, 255);
+    const hat = make_triangle(list, room1_player_x, room1_player_y - 27, 28, 10, 20, 20, 25, 255);
+    room1_player_parts = [[body, 0, 0], [head, 0, -18], [hat, 0, -27]];
+
+    // -- dialogue box: bigger, bolder title, wrapped body text, and
+    //    a "press to continue" prompt (see draw_dialogue/close_dialogue) --
+    room1_dialogue_box = make_rect(list, SCREEN_WIDTH / 2, 495, 620, 140, 15, 12, 15, 0);
+
+    const lines = [
+        ["window", "Window", "Moonlight spills through the grimy glass, falling squarely", "on the painting across the room."],
+        ["curtain", "Curtain", "You pull the curtain aside - just old,", "faded fabric."],
+        ["carpet", "Carpet", "A faded carpet, threadbare with age.", "Nothing underneath."],
+        ["door_locked", "Door", "The door is locked.", ""],
+        ["painting_solved", "Painting", "You hear a clicking sound behind the painting...", "The frame slides aside on its own."],
+        ["switch_flip", "Switch", "A hidden mechanism has been activated.", "Something shifts elsewhere in the room."],
+        ["switch_already", "Switch", "The switch has already been thrown.", ""],
+        ["desk_locked", "Desk", "The desk drawer won't budge - maybe it's", "puzzle-locked."],
+        ["painting_locked", "Painting", "The frame won't move yet. Perhaps a clue", "is needed first."],
+        ["bookshelf_locked", "Bookshelf", "The shelf won't slide - something else", "must be triggered first."],
+        ["bookshelf_solved", "Bookshelf", "The bookshelf slides open, revealing a hidden", "compartment - and an old treasure chest."],
+        ["safe_locked", "Chest", "A heavy old chest. It needs a code.", ""],
+        ["chest_unlocked", "Chest", "The lock suddenly clicks open...", "The lid creaks wide - something golden glints inside."],
+        ["key_pickup", "Key", "You obtained the Room 1 Master Key.", "The exit door creaks - it should open now."],
+        ["door_complete", "Room 1 Complete", "The door swings open into darkness beyond.", ""]
+    ];
+    for (let i = 0; i < array_length(lines); i = i + 1) {
+        const key = lines[i][0];
+        const title = lines[i][1];
+        const line1 = lines[i][2];
+        const line2 = lines[i][3];
+        const title_obj = make_text(list, SCREEN_WIDTH / 2, 440, title, 0.8, 255, 225, 140, 0);
+        const line1_obj = make_text(list, SCREEN_WIDTH / 2, 478, line1, 0.68, 240, 232, 215, 0);
+        const line2_obj = make_text(list, SCREEN_WIDTH / 2, 506, line2, 0.68, 240, 232, 215, 0);
+        room1_dialogue_texts[array_length(room1_dialogue_texts)] = [key, title_obj, line1_obj, line2_obj];
+    }
+
+    room1_dialogue_continue = make_text(list, SCREEN_WIDTH / 2, 548, "Press SPACE to continue", 0.5, 200, 195, 180, 0);
+
+    // floating interact prompt ("Press E to ...")
+    room1_prompt_bg = make_rect(list, 0, 0, 220, 30, 15, 12, 15, 0);
+    room1_prompt_text = make_text(list, 0, 0, "Press E to Inspect", 0.6, 255, 230, 120, 0);
+
+    // help text
+    make_text(list, SCREEN_WIDTH / 2, 590, "WASD to move, E to interact, ESC to close a puzzle / return to the hallway", 0.5, 190, 185, 170, 200);
+
+    return [candle, dust];
+}
+
+// ----------------------------------------------------------------
+//  Re-applies persistent boolean state to visuals after a scene
+//  switch, since hide_scene()/show_scene() reset alpha back to
+//  whatever it was at object-creation time. (The slide/fade reveal
+//  animations are instead recomputed continuously every frame in
+//  animate_room(), via anim_progress(), so they don't need to be
+//  re-synced here.)
+// ----------------------------------------------------------------
+function sync_room1_visuals() {
+    const lock_alpha = room1_state[ST_DOOR] ? 0 : 255;
+    for (let i = 0; i < array_length(room1_lock_parts); i = i + 1) {
+        update_color(room1_lock_parts[i], [
+            i === 1 ? 210 : 40,
+            i === 1 ? 175 : (i === 0 ? 40 : 30),
+            i === 1 ? 60 : (i === 0 ? 45 : 15),
+            lock_alpha
+        ]);
+    }
+    update_color(room1_lock_label, [220, 90, 80, lock_alpha]);
+    update_color(room1_door_frame, room1_state[ST_DOOR]
+        ? [55, 70, 45, 255]
+        : [40, 36, 40, 255]);
+
+    return undefined;
+}
+
+// Entry point used by Room Select's door-1 -> resyncs visuals so
+// re-entering after leaving mid-puzzle still looks correct.
+function enter_room1() {
+    door_fade_state = "none";
+    change_scene("room1");
+    close_dialogue();
+    close_puzzle();
+    sync_room1_visuals();
+    return undefined;
+}
+
+// ----------------------------------------------------------------
+//  GAMEPLAY: movement, highlighting, interaction, dialogue
+// ----------------------------------------------------------------
+function collides_with_furniture(x, y) {
+    let blocked = false;
+    for (let i = 0; i < array_length(room1_blocking_rects); i = i + 1) {
+        const r = room1_blocking_rects[i];
+        const is_door = r[4] === "door";
+        const skip = is_door && room1_state[ST_DOOR];
+        if (!skip) {
+            const half_w = r[2] / 2 + PLAYER_RADIUS;
+            const half_h = r[3] / 2 + PLAYER_RADIUS;
+            if (x > r[0] - half_w && x < r[0] + half_w && y > r[1] - half_h && y < r[1] + half_h) {
+                blocked = true;
+            }
+        }
+    }
+    return blocked;
+}
+
+function update_room1_movement() {
+    let dx = 0;
+    let dy = 0;
+    if (input_key_down("a") || input_key_down("ArrowLeft")) { dx = dx - PLAYER_SPEED; }
+    if (input_key_down("d") || input_key_down("ArrowRight")) { dx = dx + PLAYER_SPEED; }
+    if (input_key_down("w") || input_key_down("ArrowUp")) { dy = dy - PLAYER_SPEED; }
+    if (input_key_down("s") || input_key_down("ArrowDown")) { dy = dy + PLAYER_SPEED; }
+
+    let new_x = room1_player_x + dx;
+    if (!collides_with_furniture(new_x, room1_player_y) && new_x - PLAYER_RADIUS > ROOM1_MIN_X && new_x + PLAYER_RADIUS < ROOM1_MAX_X) {
+        room1_player_x = new_x;
+    }
+
+    let new_y = room1_player_y + dy;
+    if (!collides_with_furniture(room1_player_x, new_y) && new_y - PLAYER_RADIUS > ROOM1_MIN_Y && new_y + PLAYER_RADIUS < ROOM1_MAX_Y) {
+        room1_player_y = new_y;
+    }
+
+    for (let i = 0; i < array_length(room1_player_parts); i = i + 1) {
+        const part = room1_player_parts[i];
+        update_position(part[0], [room1_player_x + part[1], room1_player_y + part[2]]);
+    }
+
+    return undefined;
+}
+
+function update_room1_highlights(t) {
+    let nearest_name = "";
+    let nearest_prompt = "Press E to Inspect";
+    let nearest_x = 0;
+    let nearest_y = 0;
+    let nearest_dist = 999999;
+
+    for (let i = 0; i < array_length(room1_interactables); i = i + 1) {
+        const entry = room1_interactables[i];
+        const name = entry[0];
+        const x = entry[1];
+        const y = entry[2];
+        const range = entry[3];
+        const ring = entry[4];
+        const visible_fn = entry[5];
+        const prompt_label = entry[6];
+
+        if (visible_fn()) {
+            const dx = room1_player_x - x;
+            const dy = room1_player_y - y;
+            const dist = math_sqrt(dx * dx + dy * dy);
+
+            if (dist < range) {
+                const pulse = 90 + 70 * math_sin(t * 5);
+                update_color(ring, [255, 235, 150, pulse]);
+                if (dist < nearest_dist) {
+                    nearest_dist = dist;
+                    nearest_name = name;
+                    nearest_prompt = prompt_label;
+                    nearest_x = x;
+                    nearest_y = y;
+                }
+            } else {
+                update_color(ring, [255, 235, 150, 0]);
+            }
+        } else {
+            update_color(ring, [255, 235, 150, 0]);
+        }
+    }
+
+    room1_nearest_name = nearest_name;
+    room1_nearest_prompt = nearest_prompt;
+
+    if (nearest_name !== "") {
+        update_position(room1_prompt_text, [nearest_x, nearest_y - 60]);
+        update_position(room1_prompt_bg, [nearest_x, nearest_y - 60]);
+        update_color(room1_prompt_text, [255, 230, 120, 255]);
+        update_color(room1_prompt_bg, [15, 12, 15, 170]);
+    } else {
+        update_color(room1_prompt_text, [255, 230, 120, 0]);
+        update_color(room1_prompt_bg, [15, 12, 15, 0]);
+    }
+
+    return undefined;
+}
+
+// ----------------------------------------------------------------
+//  draw_dialogue() - shows the matching [title, line1, line2] for a
+//  given key, plus the shared "press to continue" prompt.
+// ----------------------------------------------------------------
+function draw_dialogue(key) {
+    for (let i = 0; i < array_length(room1_dialogue_texts); i = i + 1) {
+        const entry = room1_dialogue_texts[i];
+        const is_match = entry[0] === key;
+        const alpha = is_match ? 255 : 0;
+        update_color(entry[1], [255, 225, 140, alpha]);
+        update_color(entry[2], [240, 232, 215, alpha]);
+        update_color(entry[3], [240, 232, 215, alpha]);
+    }
+    update_color(room1_dialogue_box, [15, 12, 15, 220]);
+    update_color(room1_dialogue_continue, [200, 195, 180, 255]);
+    room1_dialogue_timer = DIALOGUE_FRAMES;
+    return undefined;
+}
+
+// ----------------------------------------------------------------
+//  close_dialogue() - hides every dialogue text plus the box/prompt.
+// ----------------------------------------------------------------
+function close_dialogue() {
+    for (let i = 0; i < array_length(room1_dialogue_texts); i = i + 1) {
+        const entry = room1_dialogue_texts[i];
+        update_color(entry[1], [255, 225, 140, 0]);
+        update_color(entry[2], [240, 232, 215, 0]);
+        update_color(entry[3], [240, 232, 215, 0]);
+    }
+    update_color(room1_dialogue_box, [15, 12, 15, 0]);
+    update_color(room1_dialogue_continue, [200, 195, 180, 0]);
+    room1_dialogue_timer = 0;
+    return undefined;
+}
+
+// SPACE / ENTER / mouse click all dismiss the dialogue early; it
+// also still auto-closes on its own after DIALOGUE_FRAMES as a
+// fallback for anyone who doesn't press anything.
+function update_room1_dialogue_timer(confirmed, clicked) {
+    if (room1_dialogue_timer > 0) {
+        if (confirmed || clicked) {
+            close_dialogue();
+            return undefined;
+        }
+        room1_dialogue_timer = room1_dialogue_timer - 1;
+        if (room1_dialogue_timer === 0) {
+            close_dialogue();
+        }
+    }
+    return undefined;
+}
+
+// ----------------------------------------------------------------
+//  Main interaction dispatcher for the "E" key. Puzzle-gated
+//  objects launch their popup via start_puzzle(); everything else
+//  is a simple flavour line or a direct state flip.
+// ----------------------------------------------------------------
+function search_object(name, loop_count) {
+    if (name === "desk") {
+        if (!room1_state[ST_DESK]) {
+            start_puzzle("desk");
+        }
+    } else if (name === "painting") {
+        if (!room1_state[ST_DESK]) {
+            draw_dialogue("painting_locked");
+        } else if (!room1_state[ST_PAINTING]) {
+            start_puzzle("painting");
+        }
+    } else if (name === "switch") {
+        if (!room1_state[ST_SWITCH]) {
+            toggle_switch(loop_count);
+        } else {
+            draw_dialogue("switch_already");
+        }
+    } else if (name === "chest") {
+        if (!room1_state[ST_SWITCH]) {
+            draw_dialogue("bookshelf_locked");
+        } else if (!room1_state[ST_BOOKSHELF]) {
+            // The bookshelf hasn't slid yet - the chest shouldn't be visible
+            // This should never happen because chest_visible() gates it,
+            // but if it does, give a hint.
+            draw_dialogue("bookshelf_locked");
+        } else if (!room1_state[ST_SAFE]) {
+            start_puzzle("safe");
+        }
+    } else if (name === "bookshelf") {
+        if (!room1_state[ST_SWITCH]) {
+            draw_dialogue("bookshelf_locked");
+        } else if (!room1_state[ST_BOOKSHELF]) {
+            start_puzzle("bookshelf");
+        }
+    } else if (name === "key") {
+        if (room1_state[ST_CHEST_OPEN] && !room1_state[ST_KEY]) {
+            pickup_room_key();
+            unlock_exit_door();
+        }
+    } else if (name === "door") {
+        if (room1_state[ST_DOOR]) {
+            draw_dialogue("door_complete");
+            start_door_fade();
+        } else if (player_has_room1_key) {
+            // key was collected but somehow the door state wasn't
+            // flipped yet (defensive fallback) - unlock now.
+            unlock_exit_door();
+            draw_dialogue("door_complete");
+            start_door_fade();
+        } else {
+            draw_dialogue("door_locked");
+        }
+    } else if (name === "window") {
+        draw_dialogue("window");
+    } else if (name === "curtain") {
+        draw_dialogue("curtain");
+    } else if (name === "carpet") {
+        draw_dialogue("carpet");
+    }
+    return undefined;
+}
+
+function check_door_walkthrough() {
+    // Walking through an already-open door is a convenience shortcut
+    // ONLY after the fade-triggered "Room 1 Complete" transition has
+    // finished at least once; the very first unlock always goes
+    // through the deliberate "Press E to Unlock Door" fade sequence
+    // in search_object("door").
+    if (room1_state[ST_DOOR] && door_fade_state === "none" && room1_door_walked_once) {
+        const dx = room1_player_x - 735;
+        const dy = room1_player_y - 460;
+        const dist = math_sqrt(dx * dx + dy * dy);
+        if (dist < 45) {
+            change_scene("room_select");
+        }
+    }
+    return undefined;
+}
+let room1_door_walked_once = false;
+
+// ----------------------------------------------------------------
+//  Screen fade used for "unlock door -> opening animation -> fade
+//  back to the hallway -> ROOM 1 COMPLETE checklist -> fade in".
+//  The fade rectangle AND the completion-screen texts are all
+//  registered with `undefined` (not any scene's entries), so they
+//  are never moved off-screen or hidden by hide_scene()/show_scene()
+//  - they need to stay on top and visible through the scene switch
+//  itself. This whole block is what implements STEP 3's "fade the
+//  screen smoothly to black" and STEP 4's "ROOM 1 COMPLETE" pause.
+// ----------------------------------------------------------------
+let room1_fade_rect = null;
+let door_fade_state = "none"; // "none" | "fading_out" | "holding" | "fading_in"
+let door_fade_timer = 0;
+const DOOR_FADE_FRAMES = math_round(0.6 * FPS);
+
+// -- "ROOM 1 COMPLETE" checklist screen, shown during the "holding"
+//    phase of the door fade (i.e. while the screen is fully black,
+//    right after arriving back in the hallway but before fading in) --
+let room1_complete_title = null;
+let room1_complete_lines = []; // 3 checklist line objects
+const ROOM1_COMPLETE_HOLD_FRAMES = math_round(2.2 * FPS); // STEP 4: pause 2-3s
+
+function show_room1_complete_screen() {
+    update_color(room1_complete_title, [255, 220, 130, 255]);
+    for (let i = 0; i < array_length(room1_complete_lines); i = i + 1) {
+        update_color(room1_complete_lines[i], [220, 235, 210, 255]);
+    }
+    return undefined;
+}
+
+function hide_room1_complete_screen() {
+    update_color(room1_complete_title, [255, 220, 130, 0]);
+    for (let i = 0; i < array_length(room1_complete_lines); i = i + 1) {
+        update_color(room1_complete_lines[i], [220, 235, 210, 0]);
+    }
+    return undefined;
+}
+
+// play_door_animation() / start_door_fade() - STEP 3: kicks off the
+// "opening animation -> fade to black" sequence. The door swing/lock
+// visuals themselves are already applied instantly by unlock_exit()
+// -> sync_room1_visuals() (lock disappears, frame recolors); this
+// function's job is purely the timed fade-out that follows.
+function start_door_fade() {
+    door_fade_state = "fading_out";
+    door_fade_timer = 0;
+    room1_door_walked_once = true;
+    return undefined;
+}
+
+function play_door_animation() {
+    return start_door_fade();
+}
+
+// transition_to_hallway() - STEP 5: the actual scene switch + hallway
+// resync + Room 2 unlock announcement, factored out of
+// update_door_fade() so it can be named/called explicitly and so the
+// door-fade state machine reads cleanly.
+function transition_to_hallway() {
+    change_scene("room_select");
+    sync_room_select_visuals(hallway_doors);
+
+    // Reveal the Room 2 unlock announcement only once we're actually
+    // back in the hallway (not the instant the key was picked up
+    // inside Room 1).
+    if (pending_room2_announcement) {
+        door_unlock_flash_until = get_loop_count() + math_round(1.2 * FPS);
+        room2_unlock_banner_until = get_loop_count() + math_round(2.5 * FPS);
+        pending_room2_announcement = false;
+    }
+    return undefined;
+}
+
+function update_door_fade() {
+    if (door_fade_state === "fading_out") {
+        door_fade_timer = door_fade_timer + 1;
+        const p = math_min(1, door_fade_timer / DOOR_FADE_FRAMES);
+        update_color(room1_fade_rect, [0, 0, 0, 255 * p]);
+        if (p >= 1) {
+            transition_to_hallway();
+            show_room1_complete_screen();
+            door_fade_state = "holding";
+            door_fade_timer = 0;
+        }
+    } else if (door_fade_state === "holding") {
+        door_fade_timer = door_fade_timer + 1;
+        if (door_fade_timer >= ROOM1_COMPLETE_HOLD_FRAMES) {
+            hide_room1_complete_screen();
+            door_fade_state = "fading_in";
+            door_fade_timer = 0;
+        }
+    } else if (door_fade_state === "fading_in") {
+        door_fade_timer = door_fade_timer + 1;
+        const p = math_min(1, door_fade_timer / DOOR_FADE_FRAMES);
+        update_color(room1_fade_rect, [0, 0, 0, 255 * (1 - p)]);
+        if (p >= 1) {
+            door_fade_state = "none";
+        }
+    }
+    return undefined;
+}
+
+// ----------------------------------------------------------------
+//  ANIMATE: candle flicker, dust, moonlight shift, curtain sway,
+//  plus every puzzle-reward slide/fade animation, plus the
+//  selected-character signature accessory glow.
+// ----------------------------------------------------------------
+function animate_room(candle, dust, window_glass, curtain, t, loop_count) {
+    animate_candles([candle], t);
+    animate_dust(dust, t);
+
+    // slowly shifting moonlight through the window
+    const moon_b = 80 + 25 * math_sin(t * 0.15);
+    const moon_a = 170 + 40 * math_sin(t * 0.1);
+    update_color(window_glass, [40, 55, moon_b, moon_a]);
+
+    // gentle ambient curtain sway
+    const sway = 0.05 * math_sin(t * 0.6);
+    update_rotation(curtain, sway);
+
+    // desk drawer slides open once the desk puzzle is solved
+    const drawer_p = anim_progress(drawer_open_start, loop_count);
+    update_position(room1_drawer1, [190, 462 + 22 * drawer_p]);
+
+    // painting slides aside once its puzzle is solved
+    const painting_p = anim_progress(painting_move_start, loop_count);
+    for (let i = 0; i < array_length(room1_painting_parts); i = i + 1) {
+        const part = room1_painting_parts[i];
+        update_position(part[0], [part[1] - 35 * painting_p, part[2]]);
+    }
+    update_color(room1_switch_sprite, [60, 55, 50, 255 * painting_p]);
+    if (painting_p > 0) {
+        const glow_pulse = 0.9 + 0.3 * math_sin(t * 3);
+        const glow_alpha = (60 + 40 * math_sin(t * 3)) * painting_p;
+        update_scale(room1_switch_glow, [glow_pulse, glow_pulse]);
+        update_color(room1_switch_glow, [255, 240, 140, glow_alpha]);
+    }
+
+    // switch lever animates between "off" (down) and "on" (up) with
+    // a quick smooth swing whenever toggle_switch() has just fired
+    const switch_p = anim_progress(switch_toggle_start, loop_count);
+    update_color(room1_switch_lever, [210, 175, 60, 255 * painting_p]);
+    update_rotation(room1_switch_lever, -0.9 * switch_p);
+    update_position(room1_switch_lever, [430, 190 - 4 * switch_p]);
+
+    // bookshelf slides aside once its puzzle is solved
+    const bookshelf_p = anim_progress(bookshelf_move_start, loop_count);
+    for (let i = 0; i < array_length(room1_bookshelf_parts); i = i + 1) {
+        const part = room1_bookshelf_parts[i];
+        update_position(part[0], [part[1] - 30 * bookshelf_p, part[2]]);
+    }
+
+    // treasure chest fades in once revealed, then its lid swings open
+    // once the chest lock is solved
+    const chest_open_p = anim_progress(chest_open_start, loop_count);
+    for (let i = 0; i < array_length(room1_chest_parts); i = i + 1) {
+        const part = room1_chest_parts[i];
+        const base_col = part === room1_chest_lid ? [90, 60, 33] : (part === room1_chest_parts[1] ? [200, 170, 70] : [74, 48, 26]);
+        update_color(part, [base_col[0], base_col[1], base_col[2], 255 * bookshelf_p]);
+    }
+    // lid rotates open + lifts slightly, hinge at its back edge
+    update_rotation(room1_chest_lid, -0.9 * chest_open_p);
+    update_position(room1_chest_lid, [175, 415 - 8 * chest_open_p]);
+
+    // key reward animation (glow/rise/scale/sparkles/banner/flash)
+    play_key_animation(t, loop_count);
+
+    // selected character's signature accessory glow (lantern/cross/torch/mystery)
+    animate_character_accessory(t);
+
+    return undefined;
+}
+
+// ================================================================
+//  SCENE 4: ROOM 2 - THE BLACKWOOD LIBRARY (cinematic introduction)
+//
+//  Scope of this pass: ONLY the cinematic intro + a bare playable
+//  room the player can walk around in afterwards. No puzzles,
+//  suspects, evidence, or clue interactions yet - those come later.
+//
+//  Same rule as every other scene: every object is created exactly
+//  once, up front, in the "ASSEMBLE ALL SCENES" section below.
+//  Nothing is ever created inside update_loop. The whole cinematic
+//  is one deterministic, frame-driven timeline - see the R2_B*
+//  cumulative frame-boundary constants below - so it can be
+//  retimed just by editing the R2_T_* duration constants above them.
+//
+//  Player control is withheld until the very end of the timeline
+//  (see room2_control_enabled), which is how "the player should NOT
+//  be able to move during the cinematic" is enforced.
+// ================================================================
+
+const R2_CX = SCREEN_WIDTH / 2;
+
+// ---- persistent objects, filled in by the draw_room2_* functions ----
+let room2_title_text = null;
+let room2_subtitle_text = null;
+let room2_line1_text = null;
+let room2_line2_text = null;
+
+let room2_fireplace_glow = null;
+let room2_fireplace_flame_outer = null;
+let room2_fireplace_flame_inner = null;
+
+let room2_clock_pendulum = null;
+
+let room2_rain_drops = []; // [obj, baseX, baseY, speed]
+let room2_curtain_l = null;
+let room2_curtain_r = null;
+
+let room2_candle = null; // [flame_outer, flame_inner, glow, phase]
+let room2_dust = [];
+
+let room2_professor_body = null;
+let room2_professor_head = null;
+let room2_professor_arm = null;   // writing arm
+let room2_chair = null;
+let room2_teacup_whole = [];      // parts visible before the murder
+let room2_teacup_broken = [];     // parts revealed after (alpha 0 until then)
+let room2_letter_whole = null;
+let room2_letter_torn = [];       // two torn halves, alpha 0 until reveal
+let room2_papers = [];
+
+let room2_door = null;            // library entrance door (swings open)
+let room2_door_gap = null;        // dark gap revealed as the door opens
+let room2_shadow_parts = [];      // silhouette figure in the doorway
+
+let room2_lightning_rect = null;  // full-screen white flash overlay
+let room2_fade_rect = null;       // full-screen black fade overlay (own, persistent)
+
+let room2_player_parts = []; // [obj, offsetX, offsetY]
+let room2_player_x = 690;
+let room2_player_y = 500;
+
+const ROOM2_MIN_X = 65;
+const ROOM2_MAX_X = 735;
+const ROOM2_MIN_Y = 235;
+const ROOM2_MAX_Y = 575;
+
+// -- small math helper, local to this section --
+function clamp01(p) {
+    return math_min(1, math_max(0, p));
+}
+
+// ----------------------------------------------------------------
+//  DRAWING - Victorian library environment. Everything here is
+//  opaque and static (never toggled) except where noted; the
+//  cinematic "reveals" it by fading room2_fade_rect, not by hiding
+//  the furniture itself.
+// ----------------------------------------------------------------
+function draw_room2_layout(list) {
+    // back wall - dark wood panelling
+    make_rect(list, R2_CX, 170, SCREEN_WIDTH, 340, 38, 28, 24, 255);
+    for (let row = 0; row < 3; row = row + 1) {
+        make_rect(list, R2_CX, 55 + row * 95, SCREEN_WIDTH, 2, 25, 18, 15, 150);
+    }
+    // wooden floor
+    make_rect(list, R2_CX, 480, SCREEN_WIDTH, 240, 58, 38, 24, 255);
+    for (let plank = 0; plank < 9; plank = plank + 1) {
+        make_rect(list, 20 + plank * 90, 480, 4, 240, 40, 26, 16, 255);
+    }
+    make_rect(list, R2_CX, 360, SCREEN_WIDTH, 10, 20, 14, 10, 255);
+    return undefined;
+}
+
+function draw_room2_bookshelves(list) {
+    // two tall bookshelves flanking the room
+    for (let side = 0; side < 2; side = side + 1) {
+        const x = side === 0 ? 200 : 730;
+        make_rect(list, x, 210, 110, 320, 40, 26, 16, 255);
+        for (let shelf = 0; shelf < 5; shelf = shelf + 1) {
+            make_rect(list, x, 90 + shelf * 62, 100, 6, 25, 16, 10, 255);
+        }
+    
+        for (let book = 0; book < 9; book = book + 1) {
+            const bx = x - 42 + book * 10.5;
+            const shelf_row = book % 5;
+            const by = 75 + shelf_row * 62;
+            const br = 55 + math_random() * 70;
+            const bg = 25 + math_random() * 35;
+            const bb = 18 + math_random() * 25;
+            make_rect(list, bx, by, 8, 32, br, bg, bb, 255);
+        }
+    }
+    return undefined;
+}
+
+function draw_room2_fireplace(list) {
+    const x = 730;
+    const y = 400;
+    make_rect(list, x, y, 150, 170, 55, 50, 48, 255);
+    make_rect(list, x, y - 78, 170, 16, 70, 62, 55, 255);
+    make_rect(list, x, y + 20, 100, 110, 15, 10, 8, 255);
+    const glow = make_circle(list, x, y + 55, 70, 255, 140, 50, 90);
+    const flame_outer = make_triangle(list, x, y + 60, 34, 55, 255, 120, 30, 255);
+    const flame_inner = make_triangle(list, x, y + 68, 18, 32, 255, 210, 90, 255);
+    room2_fireplace_glow = glow;
+    room2_fireplace_flame_outer = flame_outer;
+    room2_fireplace_flame_inner = flame_inner;
+    return undefined;
+}
+
+function draw_room2_clock(list) {
+    const x = 320;
+    const y = 330;
+    make_rect(list, x, y, 60, 260, 40, 30, 20, 255);
+    make_circle(list, x, y - 95, 34, 225, 210, 180, 255);
+    make_circle(list, x, y - 95, 28, 40, 32, 24, 255);
+    make_rect(list, x, y - 95, 3, 20, 220, 210, 195, 255);
+    const pendulum = make_circle(list, x, y + 60, 14, 200, 175, 90, 255);
+    room2_clock_pendulum = pendulum;
+    return undefined;
+}
+
+function draw_room2_window(list) {
+    const x = 500;
+    const y = 150;
+    make_rect(list, x, y, 190, 190, 30, 22, 18, 255);
+    make_rect(list, x, y, 160, 160, 25, 30, 45, 220);
+    make_rect(list, x, y, 6, 160, 30, 22, 18, 255);
+    make_rect(list, x, y, 160, 6, 30, 22, 18, 255);
+
+    for (let i = 0; i < 14; i = i + 1) {
+        const rx = x - 75 + math_random() * 150;
+        const ry = y - 75 + math_random() * 150;
+        const speed = 10 + math_random() * 8;
+        const drop = make_rect(list, rx, ry, 2, 16, 200, 215, 230, 150);
+        update_rotation(drop, 0.25);
+        room2_rain_drops[array_length(room2_rain_drops)] = [drop, rx, ry, speed];
+    }
+
+    room2_curtain_l = make_rect(list, x - 105, y, 30, 210, 70, 22, 26, 240);
+    room2_curtain_r = make_rect(list, x + 105, y, 30, 210, 70, 22, 26, 240);
+    return undefined;
+}
+
+function draw_room2_desk_scene(list) {
+    const dx = 460;
+    const dy = 430;
+
+    // desk
+    make_rect(list, dx, dy + 40, 220, 24, 65, 42, 24, 255);
+    make_rect(list, dx, dy + 24, 220, 8, 85, 55, 30, 255);
+    make_rect(list, dx - 90, dy + 75, 12, 55, 45, 30, 16, 255);
+    make_rect(list, dx + 90, dy + 75, 12, 55, 45, 30, 16, 255);
+
+    // scattered papers
+    for (let i = 0; i < 5; i = i + 1) {
+        const px = dx - 70 + i * 30 + math_random() * 10;
+        const py = dy + 5 + math_random() * 10;
+        const paper = make_rect(list, px, py, 34, 24, 225, 218, 195, 255);
+        update_rotation(paper, -0.3 + math_random() * 0.6);
+        room2_papers[array_length(room2_papers)] = paper;
+    }
+
+    // candle on the desk
+    room2_candle = draw_one_candle(list, dx + 80, dy + 8, 0.7);
+
+    // teacup - whole (visible pre-murder)
+    const cup_body = make_circle(list, dx - 75, dy + 8, 10, 235, 235, 230, 255);
+    const cup_handle = make_circle(list, dx - 63, dy + 8, 5, 235, 235, 230, 255);
+    room2_teacup_whole = [cup_body, cup_handle];
+
+    // teacup - broken pieces (hidden until the reveal)
+    const shard_1 = make_triangle(list, dx - 80, dy + 12, 10, 8, 235, 235, 230, 0);
+    const shard_2 = make_triangle(list, dx - 68, dy + 14, 8, 6, 235, 235, 230, 0);
+    const spill = make_circle(list, dx - 74, dy + 20, 14, 200, 195, 175, 0);
+    room2_teacup_broken = [shard_1, shard_2, spill];
+
+    // letter - whole (visible pre-murder)
+    room2_letter_whole = make_rect(list, dx + 20, dy - 5, 40, 26, 230, 222, 195, 255);
+
+    // letter - torn halves (hidden until reveal)
+    const torn_l = make_rect(list, dx + 6, dy - 3, 22, 24, 230, 222, 195, 0);
+    const torn_r = make_rect(list, dx + 34, dy + 2, 22, 24, 230, 222, 195, 0);
+    update_rotation(torn_l, -0.35);
+    update_rotation(torn_r, 0.4);
+    room2_letter_torn = [torn_l, torn_r];
+
+    // chair - upright behind the desk
+    room2_chair = make_rect(list, dx, dy + 110, 60, 70, 55, 36, 20, 255);
+
+    // professor writing at the desk
+    const body = make_rect(list, dx, dy - 20, 70, 90, 35, 35, 60, 255);
+    const head = make_circle(list, dx, dy - 75, 24, 210, 180, 150, 255);
+    const arm = make_rect(list, dx + 35, dy - 15, 40, 10, 30, 30, 52, 255);
+    room2_professor_body = body;
+    room2_professor_head = head;
+    room2_professor_arm = arm;
+
+    return undefined;
+}
+
+function draw_room2_globe(list) {
+    const x = 620;
+    const y = 470;
+    make_rect(list, x, y + 45, 10, 40, 60, 40, 22, 255);
+    make_circle(list, x, y, 30, 90, 130, 110, 255);
+    make_rect(list, x, y, 4, 60, 210, 195, 160, 90);
+    return undefined;
+}
+
+function draw_room2_paintings(list) {
+    make_rect(list, 640, 130, 90, 70, 35, 26, 16, 255);
+    make_rect(list, 640, 130, 74, 54, 60, 45, 32, 255);
+    return undefined;
+}
+
+function draw_room2_door(list) {
+    const x = 90;
+    const y = 460;
+    const gap = make_rect(list, x, y, 90, 190, 8, 6, 10, 0);
+    const door = make_rect(list, x, y, 90, 190, 42, 30, 20, 255);
+    make_circle(list, x + 30, y, 4, 20, 15, 10, 255);
+    room2_door_gap = gap;
+    room2_door = door;
+    return undefined;
+}
+
+function draw_room2_shadow(list) {
+    const x = 90;
+    const y = 470;
+    const head = make_circle(list, x, y - 55, 16, 5, 5, 8, 0);
+    const body = make_rect(list, x, y, 42, 100, 5, 5, 8, 0);
+    room2_shadow_parts = [head, body];
+    return undefined;
+}
+
+function draw_room2_title_texts(list) {
+    room2_title_text = make_text(list, R2_CX, 260, "MURDER CASE 001", 1.8, 230, 215, 190, 0);
+    room2_subtitle_text = make_text(list, R2_CX, 320, "The Blackwood Library Incident", 0.9, 200, 190, 175, 0);
+    room2_line1_text = make_text(list, R2_CX, 290, "A murder has taken place...", 1.0, 230, 210, 190, 0);
+    room2_line2_text = make_text(list, R2_CX, 330, "Find the truth.", 1.0, 230, 210, 190, 0);
+    return undefined;
+}
+
+function draw_room2_player(list) {
+    const body = make_circle(list, room2_player_x, room2_player_y, PLAYER_RADIUS, 35, 35, 48, 0);
+    const head = make_circle(list, room2_player_x, room2_player_y - 18, 9, 210, 180, 150, 0);
+    const hat = make_triangle(list, room2_player_x, room2_player_y - 27, 28, 10, 20, 20, 25, 0);
+    room2_player_parts = [[body, 0, 0], [head, 0, -18], [hat, 0, -27]];
+    return undefined;
+}
+
+// ----------------------------------------------------------------
+//  TIMELINE - every duration is expressed in seconds and converted
+//  to frames via FPS, then chained into cumulative frame boundaries
+//  (R2_B01..R2_B25) so the whole intro is a single readable script.
+// ----------------------------------------------------------------
+const R2_T_TITLE_FADE_IN     = math_round(0.8 * FPS);
+const R2_T_TITLE_HOLD        = math_round(3.0 * FPS); // "Hold for 3 seconds"
+const R2_T_TITLE_FADE_OUT    = math_round(0.6 * FPS);
+const R2_T_LIBRARY_FADE_IN   = math_round(1.0 * FPS); // "Fade into the library"
+const R2_T_SCENE1_HOLD       = math_round(4.0 * FPS); // writing + ambient anims
+const R2_T_LIGHTNING1        = math_round(0.4 * FPS);
+const R2_T_LIGHTNING1_SETTLE = math_round(0.5 * FPS);
+const R2_T_DOOR_OPEN         = math_round(2.0 * FPS); // door slowly opens
+const R2_T_SHADOW_APPEAR     = math_round(1.5 * FPS);
+const R2_T_SHADOW_HOLD       = math_round(1.5 * FPS);
+const R2_T_LOOKUP            = math_round(1.0 * FPS); // professor looks up
+const R2_T_LIGHTNING2        = math_round(0.3 * FPS);
+const R2_T_FADE_NEAR_BLACK   = math_round(0.7 * FPS);
+const R2_T_BLACK_HOLD        = math_round(0.6 * FPS);
+const R2_T_AFTERMATH_FADE_IN = math_round(1.0 * FPS);
+const R2_T_AFTERMATH_HOLD    = math_round(3.0 * FPS);
+const R2_T_TEXT1_FADE_IN     = math_round(0.5 * FPS);
+const R2_T_TEXT1_HOLD        = math_round(1.5 * FPS);
+const R2_T_TEXT1_FADE_OUT    = math_round(0.5 * FPS);
+const R2_T_TEXT2_FADE_IN     = math_round(0.5 * FPS);
+const R2_T_TEXT2_HOLD        = math_round(1.5 * FPS);
+const R2_T_TEXT2_FADE_OUT    = math_round(0.5 * FPS);
+const R2_T_FINAL_FADE        = math_round(1.0 * FPS);
+const R2_T_FINAL_HOLD        = math_round(0.3 * FPS);
+const R2_T_PLAYABLE_FADE_IN  = math_round(1.0 * FPS);
+
+const R2_B01 = R2_T_TITLE_FADE_IN;
+const R2_B02 = R2_B01 + R2_T_TITLE_HOLD;
+const R2_B03 = R2_B02 + R2_T_TITLE_FADE_OUT;
+const R2_B04 = R2_B03 + R2_T_LIBRARY_FADE_IN;
+const R2_B05 = R2_B04 + R2_T_SCENE1_HOLD;
+const R2_B06 = R2_B05 + R2_T_LIGHTNING1;
+const R2_B07 = R2_B06 + R2_T_LIGHTNING1_SETTLE;
+const R2_B08 = R2_B07 + R2_T_DOOR_OPEN;
+const R2_B09 = R2_B08 + R2_T_SHADOW_APPEAR;
+const R2_B10 = R2_B09 + R2_T_SHADOW_HOLD;
+const R2_B11 = R2_B10 + R2_T_LOOKUP;
+const R2_B12 = R2_B11 + R2_T_LIGHTNING2;
+const R2_B13 = R2_B12 + R2_T_FADE_NEAR_BLACK;
+const R2_B14 = R2_B13 + R2_T_BLACK_HOLD;
+const R2_B15 = R2_B14 + R2_T_AFTERMATH_FADE_IN;
+const R2_B16 = R2_B15 + R2_T_AFTERMATH_HOLD;
+const R2_B17 = R2_B16 + R2_T_TEXT1_FADE_IN;
+const R2_B18 = R2_B17 + R2_T_TEXT1_HOLD;
+const R2_B19 = R2_B18 + R2_T_TEXT1_FADE_OUT;
+const R2_B20 = R2_B19 + R2_T_TEXT2_FADE_IN;
+const R2_B21 = R2_B20 + R2_T_TEXT2_HOLD;
+const R2_B22 = R2_B21 + R2_T_TEXT2_FADE_OUT;
+const R2_B23 = R2_B22 + R2_T_FINAL_FADE;
+const R2_B24 = R2_B23 + R2_T_FINAL_HOLD;
+const R2_B25 = R2_B24 + R2_T_PLAYABLE_FADE_IN;
+
+// ---- cinematic state ------------------------------------------
+let room2_cinematic_start = -1;
+let room2_control_enabled = false;
+
+// ----------------------------------------------------------------
+//  Reusable helper functions (as requested): each owns one visual
+//  thread of the cinematic and is called every frame from
+//  play_room2_intro() with the elapsed frame count / clock.
+// ----------------------------------------------------------------
+function animate_fireplace(t) {
+    const flicker = 0.85 + 0.15 * math_sin(t * 9) + 0.06 * math_sin(t * 23);
+    update_scale(room2_fireplace_flame_outer, [flicker, flicker]);
+    update_scale(room2_fireplace_flame_inner, [flicker * 1.05, flicker * 0.95]);
+    const glow_pulse = 0.85 + 0.15 * math_sin(t * 5);
+    update_scale(room2_fireplace_glow, [glow_pulse, glow_pulse]);
+    return undefined;
+}
+
+function animate_clock(t) {
+    update_rotation(room2_clock_pendulum, 0.35 * math_sin(t * 2.4));
+    return undefined;
+}
+
+function animate_rain(t) {
+    for (let i = 0; i < array_length(room2_rain_drops); i = i + 1) {
+        const d = room2_rain_drops[i];
+        const drop = d[0];
+        const base_x = d[1];
+        const base_y = d[2];
+        const speed = d[3];
+        const fall = (t * speed * 8) % 150;
+        update_position(drop, [base_x + fall * 0.25, base_y + fall]);
+    }
+    return undefined;
+}
+
+function animate_curtains(t) {
+    const sway = 0.06 * math_sin(t * 0.7);
+    update_rotation(room2_curtain_l, sway);
+    update_rotation(room2_curtain_r, -sway);
+    return undefined;
+}
+
+function animate_candle_snuff(elapsed, t) {
+    const flame_outer = room2_candle[0];
+    const flame_inner = room2_candle[1];
+    const glow = room2_candle[2];
+    const phase = room2_candle[3];
+    if (elapsed < R2_B14) {
+        const flicker = 0.85 + 0.12 * math_sin(t * 9 + phase);
+        update_scale(flame_outer, [flicker, flicker]);
+        update_scale(flame_inner, [flicker * 1.05, flicker * 0.95]);
+        update_color(flame_outer, [255, 170, 40, 255]);
+        update_color(flame_inner, [255, 230, 120, 255]);
+        const glow_pulse = 0.85 + 0.15 * math_sin(t * 5 + phase);
+        update_scale(glow, [glow_pulse, glow_pulse]);
+        update_color(glow, [255, 200, 90, 60]);
+    } else {
+        // one candle is extinguished after the murder
+        update_color(flame_outer, [255, 170, 40, 0]);
+        update_color(flame_inner, [255, 230, 120, 0]);
+        update_color(glow, [255, 200, 90, 0]);
+    }
+    return undefined;
+}
+
+function animate_professor(elapsed, t) {
+    if (elapsed < R2_B10) {
+        // normal writing pose, arm wiggling as if scratching out notes
+        const wiggle = 4 * math_sin(t * 6);
+        update_position(room2_professor_arm, [495, 415 + wiggle]);
+        update_position(room2_professor_head, [460, 355]);
+    } else if (elapsed >= R2_B10 && elapsed < R2_B12) {
+        // the professor looks up, startled
+        const p = clamp01((elapsed - R2_B10) / R2_T_LOOKUP);
+        update_position(room2_professor_head, [460, 355 - 6 * p]);
+    }
+
+    if (elapsed >= R2_B14) {
+        // collapsed on the floor beside the toppled chair
+        update_rotation(room2_professor_body, math_PI / 2);
+        update_position(room2_professor_body, [400, 505]);
+        update_rotation(room2_professor_head, math_PI / 2);
+        update_position(room2_professor_head, [345, 500]);
+        update_rotation(room2_professor_arm, math_PI / 2);
+        update_position(room2_professor_arm, [400, 480]);
+    }
+    return undefined;
+}
+
+function animate_chair(elapsed) {
+    if (elapsed >= R2_B14) {
+        update_rotation(room2_chair, math_PI / 2);
+        update_position(room2_chair, [475, 540]);
+    }
+    return undefined;
+}
+
+function animate_desk_disturbance(elapsed) {
+    const revealed = elapsed >= R2_B14;
+    for (let i = 0; i < array_length(room2_teacup_whole); i = i + 1) {
+        update_color(room2_teacup_whole[i], [235, 235, 230, revealed ? 0 : 255]);
+    }
+    for (let i = 0; i < array_length(room2_teacup_broken); i = i + 1) {
+        update_color(room2_teacup_broken[i], [235, 235, 230, revealed ? 255 : 0]);
+    }
+    update_color(room2_letter_whole, [230, 222, 195, revealed ? 0 : 255]);
+    for (let i = 0; i < array_length(room2_letter_torn); i = i + 1) {
+        update_color(room2_letter_torn[i], [230, 222, 195, revealed ? 255 : 0]);
+    }
+    if (revealed) {
+        for (let i = 0; i < array_length(room2_papers); i = i + 1) {
+            update_rotation(room2_papers[i], 0.6 * math_sin(i * 2.1));
+        }
+    }
+    return undefined;
+}
+
+function animate_shadow(elapsed) {
+    if (elapsed >= R2_B08 && elapsed < R2_B10) {
+        const p = clamp01((elapsed - R2_B08) / R2_T_SHADOW_APPEAR);
+        for (let i = 0; i < array_length(room2_shadow_parts); i = i + 1) {
+            update_color(room2_shadow_parts[i], [5, 5, 8, 220 * p]);
+        }
+    } else if (elapsed >= R2_B10 && elapsed < R2_B14) {
+        for (let i = 0; i < array_length(room2_shadow_parts); i = i + 1) {
+            update_color(room2_shadow_parts[i], [5, 5, 8, 220]);
+        }
+    } else if (elapsed >= R2_B14) {
+        // the figure has vanished by the time the room fades back in
+        for (let i = 0; i < array_length(room2_shadow_parts); i = i + 1) {
+            update_color(room2_shadow_parts[i], [5, 5, 8, 0]);
+        }
+    }
+    return undefined;
+}
+
+function animate_room2_door(elapsed) {
+    if (elapsed >= R2_B07 && elapsed < R2_B08) {
+        const p = clamp01((elapsed - R2_B07) / R2_T_DOOR_OPEN);
+        update_rotation(room2_door, -1.1 * p);
+        update_color(room2_door_gap, [8, 6, 10, 220 * p]);
+    } else if (elapsed >= R2_B08) {
+        update_rotation(room2_door, -1.1);
+        update_color(room2_door_gap, [8, 6, 10, 220]);
+    }
+    return undefined;
+}
+
+// lightning_flash() - a brief white wash over the whole screen, with
+// a reused sound effect standing in for thunder (no new external
+// asset is added - this simply reuses the audio object already
+// loaded for the title-screen menu).
+function lightning_flash(elapsed) {
+    let alpha = 0;
+    if (elapsed >= R2_B05 && elapsed < R2_B06) {
+        const p = clamp01((elapsed - R2_B05) / R2_T_LIGHTNING1);
+        alpha = 220 * math_sin(p * math_PI);
+        if (elapsed === R2_B05) { play_audio(select_sound); }
+    } else if (elapsed >= R2_B11 && elapsed < R2_B12) {
+        const p = clamp01((elapsed - R2_B11) / R2_T_LIGHTNING2);
+        alpha = 255 * math_sin(p * math_PI);
+        if (elapsed === R2_B11) { play_audio(select_sound); }
+    }
+    update_color(room2_lightning_rect, [255, 255, 255, alpha]);
+    return undefined;
+}
+
+// fade_screen() - sets the persistent black overlay's opacity directly.
+function fade_screen(alpha) {
+    update_color(room2_fade_rect, [0, 0, 0, alpha]);
+    return undefined;
+}
+
+// update_room2_fade() - drives fade_screen() across the whole
+// timeline: black during the title card, clear through most of the
+// library scenes, briefly near-black right after the murder, and a
+// final fade to black before the playable room fades back in.
+function update_room2_fade(elapsed) {
+    let alpha = 0;
+    if (elapsed < R2_B03) {
+        alpha = 255;
+    } else if (elapsed < R2_B04) {
+        const p = clamp01((elapsed - R2_B03) / R2_T_LIBRARY_FADE_IN);
+        alpha = 255 * (1 - p);
+    } else if (elapsed < R2_B12) {
+        alpha = 0;
+    } else if (elapsed < R2_B13) {
+        const p = clamp01((elapsed - R2_B12) / R2_T_FADE_NEAR_BLACK);
+        alpha = 235 * p; // "fade almost to black", not pure 255
+    } else if (elapsed < R2_B14) {
+        alpha = 235;
+    } else if (elapsed < R2_B15) {
+        const p = clamp01((elapsed - R2_B14) / R2_T_AFTERMATH_FADE_IN);
+        alpha = 235 * (1 - p);
+    } else if (elapsed < R2_B22) {
+        alpha = 0;
+    } else if (elapsed < R2_B23) {
+        const p = clamp01((elapsed - R2_B22) / R2_T_FINAL_FADE);
+        alpha = 255 * p;
+    } else if (elapsed < R2_B24) {
+        alpha = 255;
+    } else if (elapsed < R2_B25) {
+        const p = clamp01((elapsed - R2_B24) / R2_T_PLAYABLE_FADE_IN);
+        alpha = 255 * (1 - p);
+    } else {
+        alpha = 0;
+    }
+    fade_screen(alpha);
+    return undefined;
+}
+
+function animate_room2_titles(elapsed) {
+    let title_alpha = 0;
+    if (elapsed < R2_B01) {
+        title_alpha = 255 * clamp01(elapsed / R2_T_TITLE_FADE_IN);
+    } else if (elapsed < R2_B02) {
+        title_alpha = 255;
+    } else if (elapsed < R2_B03) {
+        title_alpha = 255 * (1 - clamp01((elapsed - R2_B02) / R2_T_TITLE_FADE_OUT));
+    }
+    update_color(room2_title_text, [230, 215, 190, title_alpha]);
+    update_color(room2_subtitle_text, [200, 190, 175, title_alpha]);
+
+    let text1_alpha = 0;
+    if (elapsed >= R2_B16 && elapsed < R2_B17) {
+        text1_alpha = 255 * clamp01((elapsed - R2_B16) / R2_T_TEXT1_FADE_IN);
+    } else if (elapsed >= R2_B17 && elapsed < R2_B18) {
+        text1_alpha = 255;
+    } else if (elapsed >= R2_B18 && elapsed < R2_B19) {
+        text1_alpha = 255 * (1 - clamp01((elapsed - R2_B18) / R2_T_TEXT1_FADE_OUT));
+    }
+    update_color(room2_line1_text, [230, 210, 190, text1_alpha]);
+
+    let text2_alpha = 0;
+    if (elapsed >= R2_B19 && elapsed < R2_B20) {
+        text2_alpha = 255 * clamp01((elapsed - R2_B19) / R2_T_TEXT2_FADE_IN);
+    } else if (elapsed >= R2_B20 && elapsed < R2_B21) {
+        text2_alpha = 255;
+    } else if (elapsed >= R2_B21 && elapsed < R2_B22) {
+        text2_alpha = 255 * (1 - clamp01((elapsed - R2_B21) / R2_T_TEXT2_FADE_OUT));
+    }
+    update_color(room2_line2_text, [230, 210, 190, text2_alpha]);
+
+    return undefined;
+}
+
+// reveal_room2_player() - makes the player avatar visible once the
+// cinematic ends and control is handed over.
+function reveal_room2_player() {
+    // Apply selected character colors to Room 2 player
+    const idx = selected_character_index;
+    const body_col = CHAR_BODY_COLORS[idx];
+    const hat_col = CHAR_HAT_COLORS[idx];
+    update_color(room2_player_parts[0][0], [body_col[0], body_col[1], body_col[2], 255]);
+    update_color(room2_player_parts[1][0], [210, 180, 150, 255]);
+    update_color(room2_player_parts[2][0], [hat_col[0], hat_col[1], hat_col[2], 255]);
+    return undefined;
+}
+
+// play_room2_intro() - the single per-frame entry point for
+// everything cinematic: computes elapsed frames since the cinematic
+// began and drives every animate_*/lightning_flash/fade_screen
+// helper above from it. Also flips on player control the moment the
+// timeline reaches its end.
+function play_room2_intro(loop_count, t) {
+    const elapsed = loop_count - room2_cinematic_start;
+
+    animate_dust(room2_dust, t);
+    animate_room2_titles(elapsed);
+    animate_fireplace(t);
+    animate_clock(t);
+    animate_rain(t);
+    animate_curtains(t);
+    animate_professor(elapsed, t);
+    animate_chair(elapsed);
+    animate_candle_snuff(elapsed, t);
+    animate_desk_disturbance(elapsed);
+    animate_shadow(elapsed);
+    animate_room2_door(elapsed);
+    lightning_flash(elapsed);
+    update_room2_fade(elapsed);
+
+    if (elapsed >= R2_B24 && !room2_control_enabled) {
+        room2_control_enabled = true;
+        reveal_room2_player();
+    }
+
+    return undefined;
+}
+
+// transition_to_room2() - resets the cinematic timeline and starts
+// it fresh from a black screen ("Fade in from black").
+function transition_to_room2() {
+    room2_cinematic_start = get_loop_count();
+    room2_control_enabled = false;
+    update_color(room2_lightning_rect, [255, 255, 255, 0]);
+    fade_screen(255);
+    return undefined;
+}
+
+// enter_room2() - hallway entry point for Room 2's door, mirroring
+// enter_room1(): switches scenes, then (re)starts the cinematic.
+function enter_room2() {
+    change_scene("room2");
+    transition_to_room2();
+    return undefined;
+}
+
+// update_room2_movement() - only ever called once room2_control_enabled
+// is true (i.e. after the cinematic finishes). Simple bounds-clamped
+// WASD/arrow movement, no collision yet - clue interactions and
+// furniture collision are out of scope for this pass.
+function update_room2_movement() {
+    let dx = 0;
+    let dy = 0;
+    if (input_key_down("a") || input_key_down("ArrowLeft")) { dx = dx - PLAYER_SPEED; }
+    if (input_key_down("d") || input_key_down("ArrowRight")) { dx = dx + PLAYER_SPEED; }
+    if (input_key_down("w") || input_key_down("ArrowUp")) { dy = dy - PLAYER_SPEED; }
+    if (input_key_down("s") || input_key_down("ArrowDown")) { dy = dy + PLAYER_SPEED; }
+
+    const new_x = room2_player_x + dx;
+    if (new_x - PLAYER_RADIUS > ROOM2_MIN_X && new_x + PLAYER_RADIUS < ROOM2_MAX_X) {
+        room2_player_x = new_x;
+    }
+    const new_y = room2_player_y + dy;
+    if (new_y - PLAYER_RADIUS > ROOM2_MIN_Y && new_y + PLAYER_RADIUS < ROOM2_MAX_Y) {
+        room2_player_y = new_y;
+    }
+
+    for (let i = 0; i < array_length(room2_player_parts); i = i + 1) {
+        const part = room2_player_parts[i];
+        update_position(part[0], [room2_player_x + part[1], room2_player_y + part[2]]);
+    }
+    return undefined;
+}
+
+// ================================================================
+//  ASSEMBLE ALL SCENES (draw order = back-to-front layering)
+// ================================================================
+
+// -- landing scene --
+const door_prop_parts = draw_landing_door_prop(landing_entries);
+draw_room(landing_entries);
+draw_table(landing_entries);
+const key_parts = draw_key(landing_entries);
+const candle_flames = draw_candles(landing_entries);
+const dust_particles = create_dust(landing_entries, 10, 200, 460);
+const menu_parts = draw_menu(landing_entries);
+const menu_buttons = menu_parts[0];
+const title_parts = menu_parts[1];
+const magnifier = menu_parts[2];
+const clue_parts = menu_parts[3];
+
+// -- character selection scene --
+// FIX: the background panel is now created FIRST (before any
+// character exists), so it sits at the back of the layer stack
+// instead of painting over the characters.
+draw_char_select_background(char_select_entries);
+characters[0] = create_classic_detective(char_select_entries);
+characters[1] = create_ghost_hunter(char_select_entries);
+characters[2] = create_archaeologist(char_select_entries);
+characters[3] = create_shadow_investigator(char_select_entries);
+characters[4] = create_robot_detective(char_select_entries);
+draw_char_select_ui(char_select_entries);
+
+char_select_fade_rect = create_rectangle(SCREEN_WIDTH, SCREEN_HEIGHT);
+update_position(char_select_fade_rect, [SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2]);
+update_color(char_select_fade_rect, [0, 0, 0, 0]);
+
+// -- room select scene --
+const room_select_parts = draw_room_select(room_select_entries);
+const hallway_doors = room_select_parts[0];
+const hallway_torches = room_select_parts[1];
+const hallway_fog = room_select_parts[2];
+const hallway_rays = room_select_parts[3];
+const hallway_dust = room_select_parts[4];
+
+// -- room 1 scene --
+draw_room1_layout(room1_entries);
+const room1_window_parts = draw_furniture(room1_entries);
+const room1_window_glass = room1_window_parts[0];
+const room1_curtain = room1_window_parts[1];
+const room1_object_parts = draw_objects(room1_entries);
+const room1_candle = room1_object_parts[0];
+const room1_dust = room1_object_parts[1];
+draw_puzzle_ui(room1_entries);
+draw_room1_character_accessories(room1_entries);
+
+// screen-fade overlay - NOT registered with any scene's entries, so
+// it survives (and stays visible through) the room1 -> hallway cut.
+room1_fade_rect = create_rectangle(SCREEN_WIDTH, SCREEN_HEIGHT);
+update_position(room1_fade_rect, [SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2]);
+update_color(room1_fade_rect, [0, 0, 0, 0]);
+
+// "ROOM 1 COMPLETE" checklist screen - also NOT registered with any
+// scene, so it stays on top of the black fade rect regardless of
+// which scene is technically "current" at that moment.
+room1_complete_title = make_text(undefined, SCREEN_WIDTH / 2, 240, "ROOM 1 COMPLETE", 1.6, 255, 220, 130, 0);
+room1_complete_lines[0] = make_text(undefined, SCREEN_WIDTH / 2, 300, "\u2713 Puzzles Solved", 0.8, 220, 235, 210, 0);
+room1_complete_lines[1] = make_text(undefined, SCREEN_WIDTH / 2, 335, "\u2713 Key Collected", 0.8, 220, 235, 210, 0);
+room1_complete_lines[2] = make_text(undefined, SCREEN_WIDTH / 2, 370, "\u2713 Room Escaped", 0.8, 220, 235, 210, 0);
+
+// -- room 2 scene (The Blackwood Library) --
+draw_room2_layout(room2_entries);
+draw_room2_bookshelves(room2_entries);
+draw_room2_fireplace(room2_entries);
+draw_room2_clock(room2_entries);
+draw_room2_window(room2_entries);
+draw_room2_paintings(room2_entries);
+draw_room2_globe(room2_entries);
+draw_room2_desk_scene(room2_entries);
+draw_room2_door(room2_entries);
+draw_room2_shadow(room2_entries);
+room2_dust = create_dust(room2_entries, 16, 100, 460);
+draw_room2_player(room2_entries);
+
+// screen-fade + lightning overlays for Room 2 - NOT registered with
+// any scene's entries (same trick as room1_fade_rect above), so
+// they stay on top and persist correctly across the whole cinematic.
+room2_fade_rect = create_rectangle(SCREEN_WIDTH, SCREEN_HEIGHT);
+update_position(room2_fade_rect, [SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2]);
+update_color(room2_fade_rect, [0, 0, 0, 0]);
+
+room2_lightning_rect = create_rectangle(SCREEN_WIDTH, SCREEN_HEIGHT);
+update_position(room2_lightning_rect, [SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2]);
+update_color(room2_lightning_rect, [255, 255, 255, 0]);
+
+// Title-card / closing-line texts are registered to room2_entries,
+// but created AFTER the two overlays above so they always render
+// ON TOP of the black fade and the lightning flash (matters for the
+// title card, which is text shown over an otherwise-black screen).
+draw_room2_title_texts(room2_entries);
+
+// Apply the default character look to the Room 1 avatar up front,
+// so it's already correct even if a scene is somehow skipped.
+spawn_selected_character();
+
+// Only the landing scene starts visible - push the other scenes off
+// screen immediately, before the very first frame is drawn.
+hide_scene(char_select_entries);
+hide_scene(room_select_entries);
+hide_scene(room1_entries);
+hide_scene(room2_entries);
+sync_room1_visuals();
+sync_room_select_visuals(hallway_doors);
+sync_char_select_visuals();
+
+// ================================================================
+//  MAIN LOOP
+// ================================================================
+update_loop(game_state => {
+    const loop_count = get_loop_count();
+    const t = loop_count / FPS;
+
+    const confirmed = confirm_pressed_this_frame();
+    const clicked = mouse_clicked_this_frame();
+    const escaped = escape_pressed_this_frame();
+
+    // Runs every frame regardless of current scene, since these
+    // fades each span a scene switch themselves.
+    update_door_fade();
+    update_char_select_fade();
+
+    if (current_scene === "landing") {
+        animate_candles(candle_flames, t);
+        animate_key(key_parts, t);
+        animate_dust(dust_particles, t);
+        animate_landing_door_prop(door_prop_parts, loop_count);
+
+        update_landing_keyboard();
+        update_landing_mouse_hover(menu_buttons);
+        animate_menu_buttons(menu_buttons, t);
+        animate_title(title_parts, t);
+        animate_magnifier(magnifier, t);
+        animate_clues(clue_parts, t);
+
+        handle_landing_confirm(menu_buttons, confirmed, clicked);
+
+    } else if (current_scene === "char_select") {
+        animate_character(characters[char_select_index], t, loop_count);
+        animate_char_select_arrows(t);
+
+        if (char_select_fade_state === "none") {
+            update_char_select_input(confirmed, clicked);
+            if (escaped) {
+                change_scene("landing");
+            }
+        }
+
+    } else if (current_scene === "room_select") {
+        animate_hallway(hallway_torches, hallway_fog, hallway_rays, t);
+        animate_dust(hallway_dust, t);
+        update_room2_unlock_banner(loop_count);
+
+        update_room_selection_keyboard();
+        update_room_selection_mouse(hallway_doors);
+
+        for (let i = 0; i < array_length(hallway_doors); i = i + 1) {
+            const is_hovered = i === room_selected_index;
+            animate_door(hallway_doors[i], t, loop_count, is_hovered);
+        }
+
+        handle_room_selection(hallway_doors, confirmed, clicked, loop_count);
+
+        if (escaped) {
+            change_scene("landing");
+        }
+
+    } else if (current_scene === "room1") {
+        if (active_puzzle !== "") {
+            // A puzzle popup is open - player movement is frozen and
+            // ESC closes the puzzle instead of leaving the room.
+            draw_puzzle(loop_count, escaped, clicked);
+        } else if (key_reward_active(loop_count)) {
+            // The golden-key reward animation is playing - movement
+            // and interaction are frozen for its ~2.5s duration.
+            update_room1_dialogue_timer(confirmed, clicked);
+        } else {
+            const interacted = interact_pressed_this_frame();
+
+            update_room1_movement();
+            update_room1_highlights(t);
+            update_room1_dialogue_timer(confirmed, clicked);
+            check_door_walkthrough();
+
+            if (interacted && room1_nearest_name !== "") {
+                search_object(room1_nearest_name, loop_count);
+            }  
+
+            if (escaped && door_fade_state === "none") {
+                change_scene("room_select");
+            }
+        }
+
+        // subtle room-shake offset applied on top of the player's
+        // real position, purely visual (collision uses the real x/y),
+        // and the selected character's signature accessory follows
+        // along at the same time.
+        const shake = current_room_shake_offset(loop_count);
+        for (let i = 0; i < array_length(room1_player_parts); i = i + 1) {
+            const part = room1_player_parts[i];
+            update_position(part[0], [room1_player_x + part[1] + shake[0], room1_player_y + part[2] + shake[1]]);
+        }
+        update_character_accessory_position(20 + shake[0], 5 + shake[1]);
+
+        animate_room(room1_candle, room1_dust, room1_window_glass, room1_curtain, t, loop_count);
+
+    } else if (current_scene === "room2") {
+        // The whole cinematic (including whether control has been
+        // handed over yet) is driven from this single call.
+        play_room2_intro(loop_count, t);
+
+        if (room2_control_enabled) {
+            update_room2_movement();
+            if (escaped) {
+                change_scene("room_select");
+            }
+        }
+    }
+
+    return undefined;
+});
+
+build_game();
